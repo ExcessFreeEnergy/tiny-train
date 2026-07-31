@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 train.py - Target training payload for 15M Parameter Transformer using tinygrad.
-Features Gradient Accumulation, Dynamic Loss Scaling, and zero CPU sync stalls.
+Features Gradient Accumulation within @TinyJit, Dynamic Loss Scaling, and zero CPU sync stalls.
 """
 
 import json
@@ -30,7 +30,7 @@ def load_config(config_path: str = "config.json") -> dict:
         "ALLOW_TF32": 1,
         "BEAM": 0,
         "JIT": 1,
-        "USE_SWIGLU": 0,
+        "USE_SWIGLU": 1,
         "SEQUENCE_LENGTH": 256,
         "LEARNING_RATE": 1e-3,
         "NUM_STEPS": 20,
@@ -59,7 +59,6 @@ def get_dataset(vocab_size: int) -> np.ndarray:
 def main():
     config = load_config()
 
-    # Environment configuration override
     default_float_str = str(config.get("DEFAULT_FLOAT", "BFLOAT16")).upper()
     if default_float_str == "HALF":
         dtypes.default_float = dtypes.half
@@ -82,15 +81,13 @@ def main():
     n_layers = int(config.get("N_LAYERS", 6))
     n_heads = int(config.get("N_HEADS", 6))
     d_ff = int(config.get("D_FF", 1152))
-    use_swiglu = bool(config.get("USE_SWIGLU", 0))
+    use_swiglu = bool(config.get("USE_SWIGLU", 1))
     lr = float(config.get("LEARNING_RATE", 1e-3))
     use_jit = bool(config.get("JIT", 1))
 
-    # Load dataset
     dataset = get_dataset(vocab_size)
     data_len = len(dataset)
 
-    # Initialize model & optimizer
     Tensor.training = True
     model = GPT(
         vocab_size=vocab_size,
@@ -103,15 +100,13 @@ def main():
     )
     param_count = model.num_params()
     sys.stderr.write(
-        f"[train.py] Model initialized ({param_count:,} params | micro_batch={micro_batch_size} | grad_accum={grad_accum_steps} | eff_batch={effective_batch_size})\n"
+        f"[train.py] Model Initialized ({param_count:,} params | micro_batch={micro_batch_size} | grad_accum={grad_accum_steps} | eff_batch={effective_batch_size})\n"
     )
 
     params = get_parameters(model)
     optimizer = AdamW(params, lr=lr)
 
-    # Compute theoretical FLOPs per step (6 * params * effective_batch_size * seq_len)
     flops_per_step = 6.0 * param_count * effective_batch_size * seq_len
-    # Memory throughput estimation bytes per step
     bytes_per_step = (param_count * 2.0 + effective_batch_size * seq_len * d_model * 2.0) * 3.0
 
     def raw_step(*inputs):
@@ -128,12 +123,11 @@ def main():
         return (total_loss / grad_accum_steps).realize()
 
     if use_jit:
-        jit_step = TinyJit(raw_step)
-        step_fn = jit_step
+        step_fn = TinyJit(raw_step)
     else:
         step_fn = raw_step
 
-    def get_accum_inputs(step_idx):
+    def get_accum_inputs(step_idx: int):
         inputs = []
         for i in range(grad_accum_steps):
             offset = ((step_idx * grad_accum_steps + i) * micro_batch_size * seq_len) % (data_len - micro_batch_size * seq_len - 1)
@@ -152,7 +146,6 @@ def main():
         Device[Device.DEFAULT].synchronize()
     sys.stderr.write(f"[train.py] JIT Warmup complete in {time.time() - w_start:.2f}s\n")
 
-    # Benchmark steps
     step_times = []
     losses = []
     nan_detected = False
@@ -169,7 +162,6 @@ def main():
         step_ms = (t1 - t0) * 1000.0
         step_times.append(step_ms)
 
-        # Evaluate loss item only for logging steps
         if step == 1 or step == num_steps or step % 5 == 0:
             loss_val = float(loss_tensor.item())
             losses.append(loss_val)
@@ -184,11 +176,9 @@ def main():
     avg_step_ms = float(np.mean(step_times)) if step_times else 9999.0
     final_loss = losses[-1] if losses else float("nan")
 
-    # Compute GFLOPS and Bandwidth GB/s
     peak_gflops = (flops_per_step / (avg_step_ms / 1000.0)) / 1e9 if avg_step_ms > 0 else 0.0
     avg_bandwidth_gbps = (bytes_per_step / (avg_step_ms / 1000.0)) / 1e9 if avg_step_ms > 0 else 0.0
 
-    # Format JSON output block for harness parsing
     telemetry = {
         "step_time_ms": round(avg_step_ms, 3),
         "peak_gflops": round(peak_gflops, 1),

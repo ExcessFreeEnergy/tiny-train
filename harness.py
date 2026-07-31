@@ -108,6 +108,7 @@ def run_harness(config_path: str = "config.json") -> dict:
 
     env = os.environ.copy()
     env["DEBUG"] = "2"
+    env["TINYCACHE"] = "1"
     env["BEAM"] = str(config.get("BEAM", 0))
     env["ALLOW_TF32"] = str(config.get("ALLOW_TF32", 1))
     env["DEFAULT_FLOAT"] = str(config.get("DEFAULT_FLOAT", "BFLOAT16"))
