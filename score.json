@@ -1,0 +1,8 @@
+{
+  "step_time_ms": 1091.277,
+  "peak_gflops": 1313.7,
+  "avg_bandwidth_gbps": 0.1,
+  "final_loss": 6.1769,
+  "nan_detected": false,
+  "jit_active": true
+}
