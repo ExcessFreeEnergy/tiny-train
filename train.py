@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-train.py - Target training payload for 15M Parameter Transformer using tinygrad.
-Features Gradient Accumulation within @TinyJit, Dynamic Loss Scaling, and zero CPU sync stalls.
+train.py - Target training payload for Transformer using tinygrad.
+Features Single Micro-Batch @TinyJit Scoping, Python Gradient Accumulation, and zero CPU sync stalls.
 """
 
 import json
@@ -31,6 +31,8 @@ def load_config(config_path: str = "config.json") -> dict:
         "BEAM": 0,
         "JIT": 1,
         "USE_SWIGLU": 1,
+        "USE_ROPE": 1,
+        "PAD_VOCAB_MULTIPLE": 128,
         "SEQUENCE_LENGTH": 256,
         "LEARNING_RATE": 1e-3,
         "NUM_STEPS": 20,
@@ -76,31 +78,34 @@ def main():
 
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
     num_steps = int(config.get("NUM_STEPS", 20))
-    vocab_size = int(config.get("VOCAB_SIZE", 29362))
+    raw_vocab_size = int(config.get("VOCAB_SIZE", 29362))
     d_model = int(config.get("D_MODEL", 288))
     n_layers = int(config.get("N_LAYERS", 6))
     n_heads = int(config.get("N_HEADS", 6))
     d_ff = int(config.get("D_FF", 1152))
     use_swiglu = bool(config.get("USE_SWIGLU", 1))
+    use_rope = bool(config.get("USE_ROPE", 1))
+    pad_vocab_mult = int(config.get("PAD_VOCAB_MULTIPLE", 128))
     lr = float(config.get("LEARNING_RATE", 1e-3))
     use_jit = bool(config.get("JIT", 1))
 
-    dataset = get_dataset(vocab_size)
-    data_len = len(dataset)
+    dataset = get_dataset(raw_vocab_size)
 
     Tensor.training = True
     model = GPT(
-        vocab_size=vocab_size,
+        vocab_size=raw_vocab_size,
         d_model=d_model,
         n_layers=n_layers,
         n_heads=n_heads,
         d_ff=d_ff,
         max_len=max(seq_len, 512),
         use_swiglu=use_swiglu,
+        use_rope=use_rope,
+        pad_vocab_multiple=pad_vocab_mult,
     )
     param_count = model.num_params()
     sys.stderr.write(
-        f"[train.py] Model Initialized ({param_count:,} params | micro_batch={micro_batch_size} | grad_accum={grad_accum_steps} | eff_batch={effective_batch_size})\n"
+        f"[train.py] Model Initialized ({param_count:,} params | padded_vocab={model.vocab_size} | micro_batch={micro_batch_size} | eff_batch={effective_batch_size})\n"
     )
 
     params = get_parameters(model)
@@ -109,40 +114,32 @@ def main():
     flops_per_step = 6.0 * param_count * effective_batch_size * seq_len
     bytes_per_step = (param_count * 2.0 + effective_batch_size * seq_len * d_model * 2.0) * 3.0
 
-    def raw_step(*inputs):
-        optimizer.zero_grad()
-        total_loss = Tensor.zeros(1)
-        for i in range(grad_accum_steps):
-            x, y = inputs[2 * i], inputs[2 * i + 1]
-            logits = model.forward(x)
-            loss = logits.sparse_categorical_crossentropy(y)
-            scaled_loss = (loss / grad_accum_steps) * loss_scale
-            scaled_loss.backward()
-            total_loss = total_loss + loss.detach()
-        optimizer.step()
-        return (total_loss / grad_accum_steps).realize()
+    def raw_micro_step(x: Tensor, y: Tensor) -> tuple:
+        logits = model.forward(x)
+        loss = logits.sparse_categorical_crossentropy(y)
+        scaled_loss = (loss / grad_accum_steps) * loss_scale
+        scaled_loss.backward()
+        grads = [p.grad.realize() if p.grad is not None else Tensor.zeros(*p.shape).realize() for p in params]
+        return (loss.realize(), *grads)
 
     if use_jit:
-        step_fn = TinyJit(raw_step)
+        micro_step_fn = TinyJit(raw_micro_step)
     else:
-        step_fn = raw_step
+        micro_step_fn = raw_micro_step
 
-    def get_accum_inputs(step_idx: int):
-        inputs = []
-        for i in range(grad_accum_steps):
-            offset = ((step_idx * grad_accum_steps + i) * micro_batch_size * seq_len) % (data_len - micro_batch_size * seq_len - 1)
-            chunk = dataset[offset : offset + micro_batch_size * seq_len + 1].astype(np.int32)
-            x_np = chunk[:-1].reshape(micro_batch_size, seq_len)
-            y_np = chunk[1:].reshape(micro_batch_size, seq_len)
-            inputs.append(Tensor(x_np).realize())
-            inputs.append(Tensor(y_np).realize())
-        return inputs
+    def get_micro_batch(step_idx: int, accum_idx: int):
+        data_len = len(dataset)
+        offset = ((step_idx * grad_accum_steps + accum_idx) * micro_batch_size * seq_len) % (data_len - micro_batch_size * seq_len - 1)
+        chunk = dataset[offset : offset + micro_batch_size * seq_len + 1].astype(np.int32)
+        x_np = chunk[:-1].reshape(micro_batch_size, seq_len)
+        y_np = chunk[1:].reshape(micro_batch_size, seq_len)
+        return Tensor(x_np).realize(), Tensor(y_np).realize()
 
     sys.stderr.write("[train.py] Running 2 JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
-        w_inputs = get_accum_inputs(100 + w)
-        _ = step_fn(*w_inputs)
+        xw, yw = get_micro_batch(100, w)
+        _ = micro_step_fn(xw, yw)
         Device[Device.DEFAULT].synchronize()
     sys.stderr.write(f"[train.py] JIT Warmup complete in {time.time() - w_start:.2f}s\n")
 
@@ -152,36 +149,54 @@ def main():
 
     sys.stderr.write(f"[train.py] Running {num_steps} benchmark steps...\n")
     for step in range(1, num_steps + 1):
-        step_inputs = get_accum_inputs(step)
-
         t0 = time.time()
-        loss_tensor = step_fn(*step_inputs)
+        optimizer.zero_grad()
+        accum_losses = []
+
+        for acc in range(grad_accum_steps):
+            x_m, y_m = get_micro_batch(step, acc)
+            res = micro_step_fn(x_m, y_m)
+            m_loss = res[0]
+            m_grads = res[1:]
+
+            if step == 1 or step == num_steps or step % 5 == 0:
+                accum_losses.append(float(m_loss.item()))
+
+            for p, g in zip(params, m_grads):
+                if p.grad is None:
+                    p.grad = g
+                else:
+                    p.grad = (p.grad + g).realize()
+
+        optimizer.step()
         Device[Device.DEFAULT].synchronize()
         t1 = time.time()
 
         step_ms = (t1 - t0) * 1000.0
         step_times.append(step_ms)
 
-        if step == 1 or step == num_steps or step % 5 == 0:
-            loss_val = float(loss_tensor.item())
-            losses.append(loss_val)
+        if accum_losses:
+            step_loss_val = float(np.mean(accum_losses))
+            losses.append(step_loss_val)
 
-            if math.isnan(loss_val) or math.isinf(loss_val):
+            if math.isnan(step_loss_val) or math.isinf(step_loss_val):
                 nan_detected = True
                 sys.stderr.write(f"[train.py] NaN/Inf detected at step {step}!\n")
                 break
 
-            sys.stderr.write(f"[STEP {step:03d}] loss={loss_val:.4f} | step_time={step_ms:.2f}ms\n")
+            sys.stderr.write(f"[STEP {step:03d}] loss={step_loss_val:.4f} | step_time={step_ms:.2f}ms\n")
 
     avg_step_ms = float(np.mean(step_times)) if step_times else 9999.0
     final_loss = losses[-1] if losses else float("nan")
 
     peak_gflops = (flops_per_step / (avg_step_ms / 1000.0)) / 1e9 if avg_step_ms > 0 else 0.0
     avg_bandwidth_gbps = (bytes_per_step / (avg_step_ms / 1000.0)) / 1e9 if avg_step_ms > 0 else 0.0
+    mfu_pct = round((peak_gflops / 330000.0) * 100.0, 2)
 
     telemetry = {
         "step_time_ms": round(avg_step_ms, 3),
         "peak_gflops": round(peak_gflops, 1),
+        "mfu_pct": mfu_pct,
         "avg_bandwidth_gbps": round(avg_bandwidth_gbps, 1),
         "final_loss": round(final_loss, 4),
         "nan_detected": nan_detected,
@@ -189,6 +204,7 @@ def main():
         "micro_batch_size": micro_batch_size,
         "grad_accumulation_steps": grad_accum_steps,
         "effective_batch_size": effective_batch_size,
+        "padded_vocab_size": model.vocab_size,
     }
 
     sys.stdout.write("\n=== HARNESS TELEMETRY METRICS ===\n")

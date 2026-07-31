@@ -75,6 +75,9 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     if "peak_gflops" not in base_metrics or base_metrics["peak_gflops"] == 0:
         base_metrics["peak_gflops"] = round(max(gflops_list), 1) if gflops_list else 0.0
 
+    if "mfu_pct" not in base_metrics:
+        base_metrics["mfu_pct"] = round((base_metrics.get("peak_gflops", 0) / 330000.0) * 100.0, 2)
+
     if "avg_bandwidth_gbps" not in base_metrics or base_metrics["avg_bandwidth_gbps"] == 0:
         base_metrics["avg_bandwidth_gbps"] = round(sum(gbps_list) / max(1, len(gbps_list)), 1) if gbps_list else 0.0
 

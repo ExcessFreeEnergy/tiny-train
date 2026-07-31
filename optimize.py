@@ -109,8 +109,13 @@ def render_tui_layout(
     status_str = current_metrics.get("status", "UNKNOWN")
     status_style = "bold red" if status_str == "MEMORY_BOUND" else "bold green"
 
+    c_mfu = f"{current_metrics.get('mfu_pct', 0.0):.2f}%"
+    b_mfu = f"{best_metrics.get('mfu_pct', 0.0):.2f}%"
+
     tel_table.add_row("Step Time (ms)", c_step, b_step)
     tel_table.add_row("Throughput (smp/s)", c_tput, b_tput)
+    tel_table.add_row("Peak Compute (GFLOPS)", f"{current_metrics.get('peak_gflops', 0):.1f}", f"{best_metrics.get('peak_gflops', 0):.1f}")
+    tel_table.add_row("Model FLOPs Util (MFU)", c_mfu, b_mfu)
     tel_table.add_row("Arithmetic Intensity", f"{current_metrics.get('arithmetic_intensity', 0):.2f}", f"{best_metrics.get('arithmetic_intensity', 0):.2f}")
     tel_table.add_row("Memory Stall Pct", c_stall, b_stall)
     tel_table.add_row("Optimizer Status", Text(status_str, style=status_style), best_metrics.get("status", "-"))

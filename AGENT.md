@@ -1,28 +1,33 @@
 # AGENT.md: Tinygrad High-Performance Optimization Harness
 
 ## 1. Role & Objective
-You are an autonomous AI Agent specializing in **hardware-level GPU optimization**, **kernel fusion**, **memory bandwidth saturation**, and **arithmetic intensity optimization** for the `tinygrad` deep learning framework.
+You are an autonomous AI Agent specializing in **hardware-level GPU optimization**, **kernel fusion**, **memory bandwidth saturation**, and **Model FLOPs Utilization (MFU)** optimization for the `tinygrad` deep learning framework.
 
-Your target payload is a **15M Parameter Transformer** training locally on an **NVIDIA GeForce RTX 4090** (24 GB VRAM, Ada Lovelace architecture, ~1,008 GB/s peak memory bandwidth, ~82 TFLOPS FP32 / ~330 TFLOPS FP16 Tensor Core theoretical peak).
+Your target payload is a Transformer model training locally on an **NVIDIA GeForce RTX 4090** (24 GB VRAM, Ada Lovelace architecture, ~1,008 GB/s peak memory bandwidth, ~330 TFLOPS BF16/FP16 Tensor Core theoretical peak).
 
-Your primary objective is to **minimize training `step_time_ms`**, **maximize `samples_per_sec` throughput**, and **eliminate memory-bound kernel stalls**, while guaranteeing numerical stability (no NaNs, decreasing training loss).
+Your primary objective is to **target ~60% MFU (~198 TFLOPS)** on the target model architecture, **minimize `step_time_ms`**, **maximize `samples_per_sec` throughput**, and **eliminate memory-bound kernel stalls**, while guaranteeing numerical stability (no NaNs, decreasing training loss).
 
 ---
 
-## 2. Workspace Architecture
-The optimization harness is structured as follows:
+## 2. 2-Stage Pipeline Architecture
 
 ```text
-/tinygrad-tune-harness
-  ├── AGENT.md           # High-performance instructions & 4-phase optimization rules
-  ├── model.py           # 15M Parameter Transformer (FlashAttention SDPA + RMSNorm + SwiGLU)
-  ├── train.py           # Training payload with Tight Micro-Batch @TinyJit Scoping & Dynamic Loss Scaling
-  ├── harness.py         # Subprocess runner & OOM-safe micro-batch sweeper (TINYCACHE=1)
-  ├── optimize.py        # 4-Phase automated tuning loop agent with live TUI Visualizer (--tui)
-  ├── lint.sh            # Ruff linter & formatting script
-  ├── config.json        # Active tunable configuration parameters
-  ├── best_config.json   # Checkpoint of best discovered hyperparameter configuration
-  └── score.json         # Standardized hardware & stall telemetry output
+┌─────────────────────────────────────────────────────────────┐
+│ 1. HARNESS SUITE (Stage 1: ~3 mins)                         │
+│    ├── Precision Check (BFLOAT16 + ALLOW_TF32 enabled)      │
+│    ├── OOM-Safe Micro-Batch Sweep (Targeting >50 FLOPs/B)   │
+│    ├── SwiGLU / GELU Fusion Test (Check for kernel growth)  │
+│    └── BEAM Compiler Search (Lock layout for fixed shape)   │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Writes optimized best_config.json
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. MAIN PRODUCTION TRAINER (Stage 2: train_production.py)  │
+│    ├── Loads best_config.json (Zero compiler overhead)      │
+│    ├── Streams dataset via np.memmap (TinyStories)          │
+│    ├── Cosine LR Decay + Warmup + Safe Checkpointing        │
+│    └── Achieves high MFU immediately on Step 1              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -50,62 +55,42 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 
 ## 4. Strict High-Performance Architectural Rules
 
-To maintain **state-of-the-art GPU performance** and prevent architectural regressions, all model and trainer code MUST adhere strictly to the following rules:
+### A. Tensor Core 64/128 Divisibility Alignment
+- **Rule 1:** All matrix dimensions (`d_model`, `d_head`, `d_ff`, `vocab_size`) MUST be multiples of 64 or 128 (e.g. 128). Unaligned dimensions force Ada Lovelace Tensor Cores into zero-padded fallback routines.
+- **Rule 2:** Automatically pad `vocab_size` to a multiple of 128 (e.g. 29,362 $\rightarrow$ 29,440).
 
-### A. Zero Intermediate Flushes & Tight @TinyJit Scoping
-- **Rule 1:** NEVER call `.realize()`, `.item()`, or `.numpy()` inside `model.forward()` or intermediate layer definitions. Any intermediate call forces `tinygrad` to flush intermediate tensors to VRAM.
-- **Rule 2:** Defer `.item()` loss evaluation in `train.py` ONLY to designated logging steps. Calling `.item()` on every step causes CPU-GPU synchronization stalls.
-- **Rule 3:** ALWAYS scope `@TinyJit` to the single micro-batch step (`micro_step(x, y)`). NEVER unroll multi-step gradient accumulation loops inside `@TinyJit`.
+### B. Fused Rotary Position Embeddings (RoPE)
+- **Rule 3:** ALWAYS use Fused RoPE directly inside `CausalSelfAttention` (`apply_rope(q)` and `apply_rope(k)`), eliminating standalone position embedding VRAM reads/writes.
 
-### B. Mandatory Fused FlashAttention (SDPA)
-- **Rule 4:** NEVER construct explicit $Q K^T$ matrix multiplications or manual Softmax attention masks.
-- **Rule 5:** ALWAYS use `tinygrad.Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)` for causal self-attention.
+### C. Zero Intermediate Flushes & Tight @TinyJit Scoping
+- **Rule 4:** NEVER call `.realize()`, `.item()`, or `.numpy()` inside `model.forward()`.
+- **Rule 5:** Defer `.item()` loss evaluation in `train.py` ONLY to designated logging steps.
+- **Rule 6:** ALWAYS scope `@TinyJit` cleanly and enable `TINYCACHE=1` for instant disk-cached re-runs.
 
-### C. RMSNorm over LayerNorm
-- **Rule 6:** ALWAYS use `RMSNorm` (`(x * (x.pow(2).mean(-1, keepdim=True) + eps).rsqrt()) * weight`) instead of `LayerNorm`. `RMSNorm` eliminates mean-subtraction reduction passes and fuses cleanly into single-pass activation kernels.
-
-### D. Disk Cache Enforcement
-- **Rule 7:** Ensure `TINYCACHE=1` is set in `harness.py` so all BEAM-compiled CUDA/PTX binaries are persisted to `~/.cache/tinygrad/cache.db` for instant re-runs (<2 seconds).
-
-### E. Code Quality & Linter Compliance
-- **Rule 8:** Code MUST pass `./lint.sh` (`uv run ruff check --fix .` and `uv run ruff format .`) with zero errors or warnings before committing.
+### D. Code Quality & Linter Compliance
+- **Rule 7:** Code MUST pass `./lint.sh` (`uv run ruff check --fix .` and `uv run ruff format .`) with zero errors or warnings before committing.
 
 ---
 
-## 5. Telemetry & Memory Stall Detection (`score.json`)
+## 5. 125M Model Parameter Presets
 
-```json
-{
-  "step_time_ms": 38.42,
-  "peak_gflops": 3487.6,
-  "avg_bandwidth_gbps": 0.2,
-  "micro_batch_size": 64,
-  "grad_accumulation_steps": 4,
-  "effective_batch_size": 256,
-  "total_kernels": 142,
-  "mem_bound_kernels": 31,
-  "memory_bound_kernel_pct": 21.8,
-  "arithmetic_intensity": 8.15,
-  "status": "COMPUTE_OPTIMIZED",
-  "final_loss": 6.0497,
-  "nan_detected": false,
-  "jit_active": true
-}
-```
-
-- **`memory_bound_kernel_pct` (Stall Metric):** Percentage of executed kernels where memory bandwidth >600 GB/s but compute <15,000 GFLOPS. If >40%, `status` is set to `"MEMORY_BOUND"`.
-- **`step_time_ms` (Primary Metric):** Lower is better.
-- **`nan_detected` (Guardrail):** If `true`, configuration is invalid. Revert immediately.
+| Hyperparameter | 15M Prototype | 125M Production Target | Alignment |
+| :--- | :--- | :--- | :--- |
+| **`D_MODEL`** | 288 | **768** | Divisible by 128 |
+| **`N_LAYERS`** | 6 | **12** | - |
+| **`N_HEADS`** | 6 | **12** | $d_{head} = 64$ (Divisible by 64) |
+| **`D_FF`** | 1152 | **3072** | Divisible by 128 |
+| **`VOCAB_SIZE`** | 29,362 | **29,440** (padded) | Divisible by 128 |
 
 ---
 
-## 6. Automated Optimization Workflow
+## 6. Execution Commands
 
-Run the 4-phase automated tuner with live TUI visualizer:
 ```bash
-uv run python optimize.py --tui --max-steps 8
-```
-Or run the OOM-safe micro-batch discovery sweep directly:
-```bash
+# Stage 1: Harness Optimization Pass
 uv run python harness.py --sweep-batch
+uv run python optimize.py --tui
+
+# Stage 2: 125M Production Training Pass
+uv run python train_production.py --model-size 125M --total-steps 500
 ```
