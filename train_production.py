@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 train_production.py - Production Training Engine for 15M & 125M Parameter Transformer Models.
-Features Single Micro-Batch @TinyJit Scoping, Python Gradient Accumulation, and live MFU % telemetry.
+Features Memory-Safe @TinyJit Gradient Accumulation & Live MFU % Telemetry.
 """
 
 import argparse
@@ -58,7 +58,7 @@ def main():
         loss_scale = 1.0
 
     micro_batch_size = int(config.get("MICRO_BATCH_SIZE", 16 if args.model_size == "125M" else 64))
-    grad_accum_steps = int(config.get("GRAD_ACCUMULATION_STEPS", 16 if args.model_size == "125M" else 4))
+    grad_accum_steps = int(config.get("GRAD_ACCUMULATION_STEPS", 4))
     effective_batch_size = micro_batch_size * grad_accum_steps
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
     max_lr = float(config.get("LEARNING_RATE", 1e-3))
@@ -126,35 +126,43 @@ def main():
 
     flops_per_step = 6.0 * param_count * effective_batch_size * seq_len
 
-    # Single Micro-Batch @TinyJit Function returning Tensors
-    def raw_micro_step(x: Tensor, y: Tensor) -> tuple:
-        logits = model.forward(x)
-        loss = logits.sparse_categorical_crossentropy(y)
-        scaled_loss = (loss / grad_accum_steps) * loss_scale
-        scaled_loss.backward()
-        grads = [p.grad.realize() if p.grad is not None else Tensor.zeros(*p.shape).realize() for p in params]
-        return (loss.realize(), *grads)
+    def raw_step(*inputs):
+        optimizer.zero_grad()
+        total_loss = Tensor.zeros(1)
+        for i in range(grad_accum_steps):
+            x, y = inputs[2 * i], inputs[2 * i + 1]
+            logits = model.forward(x)
+            loss = logits.sparse_categorical_crossentropy(y)
+            scaled_loss = (loss / grad_accum_steps) * loss_scale
+            scaled_loss.backward()
+            total_loss = total_loss + loss.detach()
+        optimizer.step()
+        return (total_loss / grad_accum_steps).realize()
 
     if use_jit:
-        micro_step_fn = TinyJit(raw_micro_step)
+        step_fn = TinyJit(raw_step)
     else:
-        micro_step_fn = raw_micro_step
+        step_fn = raw_step
 
-    def get_micro_batch(data_source: np.ndarray, step_idx: int, accum_idx: int):
+    def get_accum_inputs(data_source: np.ndarray, step_idx: int):
+        inputs = []
         d_len = len(data_source)
-        offset = ((step_idx * grad_accum_steps + accum_idx) * micro_batch_size * seq_len) % (d_len - micro_batch_size * seq_len - 1)
-        chunk = data_source[offset : offset + micro_batch_size * seq_len + 1].astype(np.int32)
-        x_np = chunk[:-1].reshape(micro_batch_size, seq_len)
-        y_np = chunk[1:].reshape(micro_batch_size, seq_len)
-        return Tensor(x_np).realize(), Tensor(y_np).realize()
+        for i in range(grad_accum_steps):
+            offset = ((step_idx * grad_accum_steps + i) * micro_batch_size * seq_len) % (d_len - micro_batch_size * seq_len - 1)
+            chunk = data_source[offset : offset + micro_batch_size * seq_len + 1].astype(np.int32)
+            x_np = chunk[:-1].reshape(micro_batch_size, seq_len)
+            y_np = chunk[1:].reshape(micro_batch_size, seq_len)
+            inputs.append(Tensor(x_np).realize())
+            inputs.append(Tensor(y_np).realize())
+        return inputs
 
-    print("⏳ Warming up single micro-batch @TinyJit compilation graph...")
+    print("⏳ Warming up @TinyJit compilation graph...")
     w_start = time.time()
     for w in range(2):
-        xw, yw = get_micro_batch(train_data, 100, w)
-        _ = micro_step_fn(xw, yw)
+        w_inputs = get_accum_inputs(train_data, 100 + w)
+        _ = step_fn(*w_inputs)
         Device[Device.DEFAULT].synchronize()
-    print(f"✅ Single micro-batch @TinyJit Warmup complete in {time.time() - w_start:.2f}s\n")
+    print(f"✅ @TinyJit Warmup complete in {time.time() - w_start:.2f}s\n")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     step_times = []
@@ -164,26 +172,10 @@ def main():
         cur_lr = get_lr_schedule(step, args.total_steps, warmup_iters, max_lr, min_lr)
         optimizer.lr = cur_lr
 
+        step_inputs = get_accum_inputs(train_data, step)
+
         t0 = time.time()
-        optimizer.zero_grad()
-        accum_losses = []
-
-        for acc in range(grad_accum_steps):
-            x_m, y_m = get_micro_batch(train_data, step, acc)
-            res = micro_step_fn(x_m, y_m)
-            m_loss = res[0]
-            m_grads = res[1:]
-
-            if step == 1 or step == args.total_steps or step % 10 == 0:
-                accum_losses.append(float(m_loss.item()))
-
-            for p, g in zip(params, m_grads):
-                if p.grad is None:
-                    p.grad = g
-                else:
-                    p.grad = (p.grad + g).realize()
-
-        optimizer.step()
+        loss_tensor = step_fn(*step_inputs)
         Device[Device.DEFAULT].synchronize()
         t1 = time.time()
 
@@ -191,7 +183,7 @@ def main():
         step_times.append(step_ms)
 
         if step == 1 or step == args.total_steps or step % 10 == 0:
-            loss_val = float(np.mean(accum_losses)) if accum_losses else 0.0
+            loss_val = float(loss_tensor.item())
             throughput = (effective_batch_size / (step_ms / 1000.0)) if step_ms > 0 else 0.0
             gflops = (flops_per_step / (step_ms / 1000.0)) / 1e9 if step_ms > 0 else 0.0
             mfu_pct = (gflops / 330000.0) * 100.0
@@ -203,9 +195,9 @@ def main():
 
         # Checkpointing & Validation Eval
         if step % args.eval_interval == 0 or step == args.total_steps:
-            x_v, y_v = get_micro_batch(valid_data, step + 999, 0)
-            val_res = micro_step_fn(x_v, y_v)
-            val_loss = float(val_res[0].item())
+            val_inputs = get_accum_inputs(valid_data, step + 999)
+            val_loss_tensor = step_fn(*val_inputs)
+            val_loss = float(val_loss_tensor.item())
             print(f"📊 Validation Loss at step {step}: {val_loss:.4f}")
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")

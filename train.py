@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 train.py - Target training payload for Transformer using tinygrad.
-Features Single Micro-Batch @TinyJit Scoping, Python Gradient Accumulation, and zero CPU sync stalls.
+Features Functional Micro-Batch @TinyJit Gradient Accumulation & Live MFU % Telemetry.
 """
 
 import json
@@ -114,13 +114,14 @@ def main():
     flops_per_step = 6.0 * param_count * effective_batch_size * seq_len
     bytes_per_step = (param_count * 2.0 + effective_batch_size * seq_len * d_model * 2.0) * 3.0
 
-    def raw_micro_step(x: Tensor, y: Tensor) -> tuple:
+    def raw_micro_step(x: Tensor, y: Tensor, *accum_grads: Tensor) -> tuple:
+        optimizer.zero_grad()
         logits = model.forward(x)
         loss = logits.sparse_categorical_crossentropy(y)
         scaled_loss = (loss / grad_accum_steps) * loss_scale
         scaled_loss.backward()
-        grads = [p.grad.realize() if p.grad is not None else Tensor.zeros(*p.shape).realize() for p in params]
-        return (loss.realize(), *grads)
+        new_accum = [(a + (p.grad if p.grad is not None else Tensor.zeros(*p.shape))).realize() for a, p in zip(accum_grads, params)]
+        return (loss.realize(), *new_accum)
 
     if use_jit:
         micro_step_fn = TinyJit(raw_micro_step)
@@ -135,11 +136,15 @@ def main():
         y_np = chunk[1:].reshape(micro_batch_size, seq_len)
         return Tensor(x_np).realize(), Tensor(y_np).realize()
 
+    def make_zero_grads():
+        return [Tensor.zeros(*p.shape).clone().realize() for p in params]
+
     sys.stderr.write("[train.py] Running 2 JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
         xw, yw = get_micro_batch(100, w)
-        _ = micro_step_fn(xw, yw)
+        w_accum = make_zero_grads()
+        _ = micro_step_fn(xw, yw, *w_accum)
         Device[Device.DEFAULT].synchronize()
     sys.stderr.write(f"[train.py] JIT Warmup complete in {time.time() - w_start:.2f}s\n")
 
@@ -150,23 +155,21 @@ def main():
     sys.stderr.write(f"[train.py] Running {num_steps} benchmark steps...\n")
     for step in range(1, num_steps + 1):
         t0 = time.time()
-        optimizer.zero_grad()
+        accum_grads = make_zero_grads()
         accum_losses = []
 
         for acc in range(grad_accum_steps):
             x_m, y_m = get_micro_batch(step, acc)
-            res = micro_step_fn(x_m, y_m)
+            res = micro_step_fn(x_m, y_m, *accum_grads)
             m_loss = res[0]
-            m_grads = res[1:]
+            accum_grads = list(res[1:])
 
             if step == 1 or step == num_steps or step % 5 == 0:
                 accum_losses.append(float(m_loss.item()))
 
-            for p, g in zip(params, m_grads):
-                if p.grad is None:
-                    p.grad = g
-                else:
-                    p.grad = (p.grad + g).realize()
+        optimizer.zero_grad()
+        for p, g in zip(params, accum_grads):
+            p.grad = g
 
         optimizer.step()
         Device[Device.DEFAULT].synchronize()
