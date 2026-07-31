@@ -1,0 +1,26 @@
+# Virtual environments
+.venv/
+env/
+venv/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# Dataset files & tokenized output binaries
+data/
+*.bin
+*.npy
+*.npz
+
+# Rust / Gigatoken build artifacts
+gigatoken/target/
+gigatoken/gigatoken/*.so
+gigatoken/gigatoken/*.dylib
+gigatoken/gigatoken/*.dll
+gigatoken/gigatoken/__pycache__/
+gigatoken/dist/
+gigatoken/wheels/

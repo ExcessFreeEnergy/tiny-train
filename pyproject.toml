@@ -1,0 +1,18 @@
+[project]
+name = "tiny-train"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "gigatoken",
+    "huggingface-hub>=1.26.0",
+    "tinygrad>=0.13.0",
+]
+
+[tool.uv.workspace]
+members = [
+    "gigatoken",
+]
+
+[tool.uv.sources]
+gigatoken = { workspace = true }

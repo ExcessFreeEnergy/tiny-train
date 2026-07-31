@@ -1,0 +1,3 @@
+[submodule "gigatoken"]
+	path = gigatoken
+	url = https://github.com/marcelroed/gigatoken
