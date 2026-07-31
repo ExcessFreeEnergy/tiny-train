@@ -1,6 +1,6 @@
 """
 model.py - High-Performance 15M Parameter Transformer Architecture in tinygrad.
-Uses RMSNorm, Fused Scaled Dot-Product Attention (FlashAttention), and pure functional graph execution.
+Uses RMSNorm, Fused Scaled Dot-Product Attention (FlashAttention), and SwiGLU MLP options.
 """
 
 from tinygrad import Tensor, dtypes
@@ -40,7 +40,7 @@ class CausalSelfAttention:
         return y @ self.c_proj
 
 
-class MLP:
+class GELUMLP:
     """Feed-Forward Network with GELU activation."""
 
     def __init__(self, d_model: int, d_ff: int):
@@ -51,14 +51,26 @@ class MLP:
         return (x @ self.c_fc).gelu() @ self.c_proj
 
 
+class SwiGLUMLP:
+    """SwiGLU Gated Feed-Forward Network for Higher Arithmetic Intensity."""
+
+    def __init__(self, d_model: int, d_ff: int):
+        self.w1 = Tensor.glorot_uniform(d_model, d_ff)
+        self.w2 = Tensor.glorot_uniform(d_ff, d_model)
+        self.w3 = Tensor.glorot_uniform(d_model, d_ff)
+
+    def __call__(self, x: Tensor) -> Tensor:
+        return ((x @ self.w1).silu() * (x @ self.w3)) @ self.w2
+
+
 class Block:
     """Transformer Block with Pre-RMSNorm and Pre-Attention Residuals."""
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, use_swiglu: bool = False):
         self.rms_1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads)
         self.rms_2 = RMSNorm(d_model)
-        self.mlp = MLP(d_model, d_ff)
+        self.mlp = SwiGLUMLP(d_model, d_ff) if use_swiglu else GELUMLP(d_model, d_ff)
 
     def __call__(self, x: Tensor) -> Tensor:
         x = x + self.attn(self.rms_1(x))
@@ -77,12 +89,13 @@ class GPT:
         n_heads: int = 6,
         d_ff: int = 1152,
         max_len: int = 512,
+        use_swiglu: bool = False,
     ):
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.wte = Tensor.glorot_uniform(vocab_size, d_model)
         self.wpe = Tensor.glorot_uniform(max_len, d_model)
-        self.h = [Block(d_model, n_heads, d_ff) for _ in range(n_layers)]
+        self.h = [Block(d_model, n_heads, d_ff, use_swiglu=use_swiglu) for _ in range(n_layers)]
         self.rms_f = RMSNorm(d_model)
 
     def forward(self, idx: Tensor) -> Tensor:
@@ -94,7 +107,6 @@ class GPT:
         for block in self.h:
             x = block(x)
         x = self.rms_f(x)
-        # Compute logits with FP32 stability for large vocabulary cross-entropy
         logits = x.cast(dtypes.float) @ self.wte.cast(dtypes.float).T
         return logits
 

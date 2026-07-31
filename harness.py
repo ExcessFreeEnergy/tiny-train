@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-harness.py - Subprocess execution wrapper & telemetry parser for tinygrad training payload.
-Parses kernel-level Arithmetic Intensity and Memory-Bound Stall Metrics.
+harness.py - Subprocess execution wrapper, OOM-Safe Micro-Batch Sweeper, and Telemetry Parser.
 """
 
+import argparse
+import copy
 import json
 import os
 import re
@@ -17,13 +18,13 @@ def load_config(config_path: str = "config.json") -> dict:
         with open(config_path) as f:
             return json.load(f)
     return {
-        "BEAM": 0,
+        "MICRO_BATCH_SIZE": 64,
+        "GRAD_ACCUMULATION_STEPS": 4,
+        "DEFAULT_FLOAT": "BFLOAT16",
         "ALLOW_TF32": 1,
-        "DEFAULT_FLOAT": "FLOAT",
+        "BEAM": 0,
         "JIT": 1,
-        "BATCH_SIZE": 64,
-        "MICROBATCH_SIZE": 64,
-        "GRAD_ACCUMULATION_STEPS": 1,
+        "USE_SWIGLU": 0,
         "SEQUENCE_LENGTH": 256,
         "LEARNING_RATE": 1e-3,
         "NUM_STEPS": 20,
@@ -34,7 +35,6 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     """Parse JSON telemetry block and scan tinygrad DEBUG=2 kernel lines for Arithmetic Intensity."""
     base_metrics = {}
 
-    # 1. Parse JSON block from train.py if present
     match = re.search(r"=== HARNESS TELEMETRY METRICS ===\s*(\{.*?\})\s*=================================", output_text, re.DOTALL)
     if match:
         try:
@@ -42,11 +42,8 @@ def parse_telemetry_from_output(output_text: str) -> dict:
         except Exception:
             pass
 
-    # 2. Kernel-level DEBUG=2 parsing for Arithmetic Intensity & Stall Detection
-    # Example format: "... 0.12 ms ... 1500.2 GFLOPS ... 850.4 GB/s"
     kernel_regex = re.compile(r"(\d+\.\d+|\d+)\s*ms.*?\s*(\d+\.\d+|\d+)\s*GFLOPS.*?\s*(\d+\.\d+|\d+)\s*GB/s")
 
-    total_time_ms = 0.0
     mem_bound_kernels = 0
     total_kernels = 0
     gflops_list = []
@@ -55,24 +52,20 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     for line in output_text.splitlines():
         k_match = kernel_regex.search(line)
         if k_match:
-            time_ms, gflops, gbps = map(float, k_match.groups())
-            total_time_ms += time_ms
+            _, gflops, gbps = map(float, k_match.groups())
             total_kernels += 1
             gflops_list.append(gflops)
             gbps_list.append(gbps)
 
-            # RTX 4090 Memory-Bound Stall Signature: High Bandwidth (>600 GB/s) but Low Compute (<15,000 GFLOPS)
             if gbps > 600.0 and gflops < 15000.0:
                 mem_bound_kernels += 1
 
-    # Fallbacks for step time & loss if JSON block missing
     nan_detected = "NaN/Inf detected" in output_text or "nan" in output_text.lower()
+    oom_detected = "OutOfMemory" in output_text or "CUDA error: out of memory" in output_text or "OOM" in output_text
 
     if "step_time_ms" not in base_metrics:
         step_times = [float(m) for m in re.findall(r"step_time=([0-9.]+)\s*ms", output_text)]
-        avg_step_ms = (
-            float(sum(step_times[2:]) / len(step_times[2:])) if len(step_times) > 2 else (float(sum(step_times) / len(step_times)) if step_times else 9999.0)
-        )
+        avg_step_ms = float(sum(step_times)) / len(step_times) if step_times else 9999.0
         base_metrics["step_time_ms"] = round(avg_step_ms, 3)
 
     if "final_loss" not in base_metrics:
@@ -85,7 +78,6 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     if "avg_bandwidth_gbps" not in base_metrics or base_metrics["avg_bandwidth_gbps"] == 0:
         base_metrics["avg_bandwidth_gbps"] = round(sum(gbps_list) / max(1, len(gbps_list)), 1) if gbps_list else 0.0
 
-    # Arithmetic Intensity calculation
     avg_gflops = sum(gflops_list) / max(1, len(gflops_list)) if gflops_list else base_metrics.get("peak_gflops", 0)
     avg_gbps = sum(gbps_list) / max(1, len(gbps_list)) if gbps_list else max(1.0, base_metrics.get("avg_bandwidth_gbps", 1.0))
     arithmetic_intensity = round(avg_gflops / max(1.0, avg_gbps), 2)
@@ -101,6 +93,7 @@ def parse_telemetry_from_output(output_text: str) -> dict:
             "arithmetic_intensity": arithmetic_intensity,
             "status": status,
             "nan_detected": base_metrics.get("nan_detected", nan_detected),
+            "oom_detected": oom_detected,
             "jit_active": base_metrics.get("jit_active", "Warmup complete" in output_text),
         }
     )
@@ -113,12 +106,11 @@ def run_harness(config_path: str = "config.json") -> dict:
     print("=== Tinygrad Training Optimization Harness ===")
     print(f"Configuration: {json.dumps(config, indent=2)}")
 
-    # Set environment variables
     env = os.environ.copy()
     env["DEBUG"] = "2"
     env["BEAM"] = str(config.get("BEAM", 0))
     env["ALLOW_TF32"] = str(config.get("ALLOW_TF32", 1))
-    env["DEFAULT_FLOAT"] = str(config.get("DEFAULT_FLOAT", "FLOAT"))
+    env["DEFAULT_FLOAT"] = str(config.get("DEFAULT_FLOAT", "BFLOAT16"))
     env["JIT"] = str(config.get("JIT", 1))
 
     cmd = [sys.executable, "train.py"]
@@ -138,14 +130,13 @@ def run_harness(config_path: str = "config.json") -> dict:
 
     print(f"Subprocess completed with return code {proc.returncode} in {t1 - t0:.2f}s")
 
-    if proc.returncode != 0 and "NaN/Inf detected" not in stderr:
-        print(f"Error during execution:\n{stderr[-2000:]}")
-
     metrics = parse_telemetry_from_output(stdout + "\n" + stderr)
     if proc.returncode != 0:
-        metrics["nan_detected"] = True
+        if "OutOfMemory" in stderr or "OOM" in stderr:
+            metrics["oom_detected"] = True
+        else:
+            metrics["nan_detected"] = True
 
-    # Save score.json
     score_file = "score.json"
     with open(score_file, "w") as f:
         json.dump(metrics, f, indent=2)
@@ -158,5 +149,64 @@ def run_harness(config_path: str = "config.json") -> dict:
     return metrics
 
 
+def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256) -> int:
+    """Run OOM-Safe Micro-Batch Sweep to discover optimal hardware micro-batch size."""
+    print("\n🔍 === Phase 2: Starting OOM-Safe Micro-Batch Discovery Sweep ===")
+    test_batch = 16
+    best_throughput = 0.0
+    best_batch = 16
+
+    while test_batch <= 1024:
+        config = copy.deepcopy(base_config)
+        config["MICRO_BATCH_SIZE"] = test_batch
+        config["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // test_batch)
+
+        with open("config.json", "w") as f:
+            json.dump(config, f, indent=2)
+
+        print(f"\n[SWEEP] Testing MICRO_BATCH_SIZE={test_batch} (GRAD_ACCUM={config['GRAD_ACCUMULATION_STEPS']})...")
+        metrics = run_harness("config.json")
+
+        if metrics.get("oom_detected") or metrics.get("nan_detected"):
+            print(f"[OOM/Instability] Hit limit at MICRO_BATCH_SIZE={test_batch}")
+            break
+
+        step_time_ms = metrics.get("step_time_ms", 9999.0)
+        eff_batch = test_batch * config["GRAD_ACCUMULATION_STEPS"]
+        throughput = (eff_batch / (step_time_ms / 1000.0)) if step_time_ms > 0 else 0.0
+        ai = metrics.get("arithmetic_intensity", 0.0)
+
+        print(f"[SWEEP RESULT] MICRO_BATCH_SIZE={test_batch}: {throughput:.1f} smp/s | AI: {ai:.2f} | Step Time: {step_time_ms:.2f}ms")
+
+        if throughput > best_throughput * 1.05:
+            best_throughput = throughput
+            best_batch = test_batch
+            test_batch *= 2
+        else:
+            print(f"[SATURATED] Throughput plateaued around MICRO_BATCH_SIZE={best_batch} (Gain < 5%)")
+            break
+
+    print(f"\n✅ Winning Micro-Batch Size Locked: MICRO_BATCH_SIZE={best_batch} ({best_throughput:.1f} smp/s)")
+    final_cfg = copy.deepcopy(base_config)
+    final_cfg["MICRO_BATCH_SIZE"] = best_batch
+    final_cfg["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // best_batch)
+    with open("config.json", "w") as f:
+        json.dump(final_cfg, f, indent=2)
+
+    return best_batch
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Tinygrad Harness with OOM-Safe Micro-Batch Sweeper")
+    parser.add_argument("--sweep-batch", action="store_true", default=False, help="Run OOM-safe micro-batch discovery sweep")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    if args.sweep_batch:
+        find_optimal_batch_size(cfg)
+    else:
+        run_harness()
+
+
 if __name__ == "__main__":
-    run_harness()
+    main()

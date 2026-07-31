@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 train.py - Target training payload for 15M Parameter Transformer using tinygrad.
-Features Dynamic Loss Scaling for FP16/BF16 and Zero CPU-GPU Sync Stalls.
+Features Gradient Accumulation, Dynamic Loss Scaling, and zero CPU sync stalls.
 """
 
 import json
@@ -24,13 +24,13 @@ def load_config(config_path: str = "config.json") -> dict:
         with open(config_path) as f:
             return json.load(f)
     return {
-        "BEAM": 0,
+        "MICRO_BATCH_SIZE": 64,
+        "GRAD_ACCUMULATION_STEPS": 4,
+        "DEFAULT_FLOAT": "BFLOAT16",
         "ALLOW_TF32": 1,
-        "DEFAULT_FLOAT": "FLOAT",
+        "BEAM": 0,
         "JIT": 1,
-        "BATCH_SIZE": 64,
-        "MICROBATCH_SIZE": 64,
-        "GRAD_ACCUMULATION_STEPS": 1,
+        "USE_SWIGLU": 0,
         "SEQUENCE_LENGTH": 256,
         "LEARNING_RATE": 1e-3,
         "NUM_STEPS": 20,
@@ -60,7 +60,7 @@ def main():
     config = load_config()
 
     # Environment configuration override
-    default_float_str = str(config.get("DEFAULT_FLOAT", "FLOAT")).upper()
+    default_float_str = str(config.get("DEFAULT_FLOAT", "BFLOAT16")).upper()
     if default_float_str == "HALF":
         dtypes.default_float = dtypes.half
         loss_scale = 1.0
@@ -71,7 +71,10 @@ def main():
         dtypes.default_float = dtypes.float
         loss_scale = 1.0
 
-    batch_size = int(config.get("BATCH_SIZE", 64))
+    micro_batch_size = int(config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 64)))
+    grad_accum_steps = int(config.get("GRAD_ACCUMULATION_STEPS", 1))
+    effective_batch_size = micro_batch_size * grad_accum_steps
+
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
     num_steps = int(config.get("NUM_STEPS", 20))
     vocab_size = int(config.get("VOCAB_SIZE", 29362))
@@ -79,6 +82,7 @@ def main():
     n_layers = int(config.get("N_LAYERS", 6))
     n_heads = int(config.get("N_HEADS", 6))
     d_ff = int(config.get("D_FF", 1152))
+    use_swiglu = bool(config.get("USE_SWIGLU", 0))
     lr = float(config.get("LEARNING_RATE", 1e-3))
     use_jit = bool(config.get("JIT", 1))
 
@@ -95,30 +99,33 @@ def main():
         n_heads=n_heads,
         d_ff=d_ff,
         max_len=max(seq_len, 512),
+        use_swiglu=use_swiglu,
     )
     param_count = model.num_params()
-    sys.stderr.write(f"[train.py] High-Performance Model Initialized ({param_count:,} parameters)\n")
+    sys.stderr.write(
+        f"[train.py] Model initialized ({param_count:,} params | micro_batch={micro_batch_size} | grad_accum={grad_accum_steps} | eff_batch={effective_batch_size})\n"
+    )
 
     params = get_parameters(model)
     optimizer = AdamW(params, lr=lr)
 
-    # Compute theoretical FLOPs per step (6 * params * batch_size * seq_len)
-    flops_per_step = 6.0 * param_count * batch_size * seq_len
-    # Memory throughput estimation bytes per step (params * 2 + activations)
-    bytes_per_step = (param_count * 2.0 + batch_size * seq_len * d_model * 2.0) * 3.0
+    # Compute theoretical FLOPs per step (6 * params * effective_batch_size * seq_len)
+    flops_per_step = 6.0 * param_count * effective_batch_size * seq_len
+    # Memory throughput estimation bytes per step
+    bytes_per_step = (param_count * 2.0 + effective_batch_size * seq_len * d_model * 2.0) * 3.0
 
-    def raw_step(x, y):
+    def raw_step(*inputs):
         optimizer.zero_grad()
-        logits = model.forward(x)
-        loss = logits.sparse_categorical_crossentropy(y)
-        # Apply Loss Scaling for FP16/BF16 Dynamic Dynamic Range
-        if loss_scale != 1.0:
-            scaled_loss = loss * loss_scale
+        total_loss = Tensor.zeros(1)
+        for i in range(grad_accum_steps):
+            x, y = inputs[2 * i], inputs[2 * i + 1]
+            logits = model.forward(x)
+            loss = logits.sparse_categorical_crossentropy(y)
+            scaled_loss = (loss / grad_accum_steps) * loss_scale
             scaled_loss.backward()
-        else:
-            loss.backward()
+            total_loss = total_loss + loss.detach()
         optimizer.step()
-        return loss.realize()
+        return (total_loss / grad_accum_steps).realize()
 
     if use_jit:
         jit_step = TinyJit(raw_step)
@@ -126,18 +133,22 @@ def main():
     else:
         step_fn = raw_step
 
-    def get_batch(step_idx):
-        offset = (step_idx * batch_size * seq_len) % (data_len - batch_size * seq_len - 1)
-        chunk = dataset[offset : offset + batch_size * seq_len + 1].astype(np.int32)
-        x_np = chunk[:-1].reshape(batch_size, seq_len)
-        y_np = chunk[1:].reshape(batch_size, seq_len)
-        return Tensor(x_np).realize(), Tensor(y_np).realize()
+    def get_accum_inputs(step_idx):
+        inputs = []
+        for i in range(grad_accum_steps):
+            offset = ((step_idx * grad_accum_steps + i) * micro_batch_size * seq_len) % (data_len - micro_batch_size * seq_len - 1)
+            chunk = dataset[offset : offset + micro_batch_size * seq_len + 1].astype(np.int32)
+            x_np = chunk[:-1].reshape(micro_batch_size, seq_len)
+            y_np = chunk[1:].reshape(micro_batch_size, seq_len)
+            inputs.append(Tensor(x_np).realize())
+            inputs.append(Tensor(y_np).realize())
+        return inputs
 
     sys.stderr.write("[train.py] Running 2 JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
-        xw, yw = get_batch(100 + w)
-        _ = step_fn(xw, yw)
+        w_inputs = get_accum_inputs(100 + w)
+        _ = step_fn(*w_inputs)
         Device[Device.DEFAULT].synchronize()
     sys.stderr.write(f"[train.py] JIT Warmup complete in {time.time() - w_start:.2f}s\n")
 
@@ -148,17 +159,17 @@ def main():
 
     sys.stderr.write(f"[train.py] Running {num_steps} benchmark steps...\n")
     for step in range(1, num_steps + 1):
-        x, y = get_batch(step)
+        step_inputs = get_accum_inputs(step)
 
         t0 = time.time()
-        loss_tensor = step_fn(x, y)
+        loss_tensor = step_fn(*step_inputs)
         Device[Device.DEFAULT].synchronize()
         t1 = time.time()
 
         step_ms = (t1 - t0) * 1000.0
         step_times.append(step_ms)
 
-        # Evaluate loss item only for logging to prevent unnecessary CPU sync stalls
+        # Evaluate loss item only for logging steps
         if step == 1 or step == num_steps or step % 5 == 0:
             loss_val = float(loss_tensor.item())
             losses.append(loss_val)
@@ -185,6 +196,9 @@ def main():
         "final_loss": round(final_loss, 4),
         "nan_detected": nan_detected,
         "jit_active": use_jit,
+        "micro_batch_size": micro_batch_size,
+        "grad_accumulation_steps": grad_accum_steps,
+        "effective_batch_size": effective_batch_size,
     }
 
     sys.stdout.write("\n=== HARNESS TELEMETRY METRICS ===\n")

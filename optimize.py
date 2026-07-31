@@ -2,12 +2,11 @@
 """
 optimize.py - Automated Memory-Bound Optimization Loop with TUI Visualizer.
 
-Tunes training configurations for tinygrad 15M Parameter Transformer:
-  - Detects memory-bound stalls (Arithmetic Intensity, memory_bound_kernel_pct).
-  - Scales BATCH_SIZE to overcome memory bandwidth latency.
-  - Explores BEAM search (0 -> 2 -> 4 -> 8) for L1/L2 cache locality.
-  - Tests Precision Compression (DEFAULT_FLOAT = BFLOAT16 / HALF with ALLOW_TF32=1).
-  - Provides a live TUI Visualizer Dashboard (--tui / --viz).
+Follows the 4-Phase Optimization Strategy:
+  - Phase 1: Precision & Tensor Core Unlock (DEFAULT_FLOAT=BFLOAT16, ALLOW_TF32=1)
+  - Phase 2: Micro-Batch Saturation (OOM-Safe Micro-Batch Sweep with BEAM=0)
+  - Phase 3: BEAM Layout Search (BEAM=4/8/16 on locked micro-batch shape)
+  - Phase 4: SwiGLU Activation Fusion (USE_SWIGLU=1 for higher arithmetic intensity)
 """
 
 import argparse
@@ -16,7 +15,7 @@ import json
 import os
 from typing import Any
 
-from harness import run_harness
+from harness import find_optimal_batch_size, run_harness
 
 # Import rich components for live TUI
 try:
@@ -45,11 +44,13 @@ def save_json(filepath: str, data: dict):
 
 
 def compute_throughput(config: dict, metrics: dict) -> float:
-    batch_size = config.get("BATCH_SIZE", 64)
+    mb = config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 64))
+    ga = config.get("GRAD_ACCUMULATION_STEPS", 1)
+    eff_batch = mb * ga
     step_time_ms = metrics.get("step_time_ms", 9999.0)
     if step_time_ms <= 0:
         return 0.0
-    return round((batch_size / (step_time_ms / 1000.0)), 2)
+    return round((eff_batch / (step_time_ms / 1000.0)), 2)
 
 
 def render_tui_layout(
@@ -72,19 +73,17 @@ def render_tui_layout(
         Layout(name="telemetry_panel", ratio=1),
     )
 
-    # 1. Header
     header_text = Text()
-    header_text.append(" 🚀 TINYGRAD AUTOMATED OPTIMIZATION LOOP ", style="bold white on blue")
-    header_text.append(f" | RTX 4090 (24GB) | Step {iteration}/{max_steps}", style="bold cyan")
+    header_text.append(" 🚀 TINYGRAD 4-PHASE AUTOMATED OPTIMIZER ", style="bold white on blue")
+    header_text.append(f" | RTX 4090 (24GB) | Trial {iteration}/{max_steps}", style="bold cyan")
     layout["header"].update(Panel(header_text, style="blue"))
 
-    # 2. Config Panel
     cfg_table = Table(title="Configuration State", show_header=True, header_style="bold yellow", expand=True)
     cfg_table.add_column("Parameter", style="cyan")
     cfg_table.add_column("Active Config", style="white")
     cfg_table.add_column("Best Config", style="bold green")
 
-    keys = ["BATCH_SIZE", "BEAM", "DEFAULT_FLOAT", "ALLOW_TF32", "JIT", "SEQUENCE_LENGTH"]
+    keys = ["MICRO_BATCH_SIZE", "GRAD_ACCUMULATION_STEPS", "BEAM", "DEFAULT_FLOAT", "ALLOW_TF32", "USE_SWIGLU"]
     for k in keys:
         cur_v = str(current_config.get(k, "-"))
         best_v = str(best_config.get(k, "-"))
@@ -93,7 +92,6 @@ def render_tui_layout(
 
     layout["config_panel"].update(Panel(cfg_table, border_style="yellow"))
 
-    # 3. Telemetry Panel
     tel_table = Table(title="Hardware & Stall Metrics", show_header=True, header_style="bold magenta", expand=True)
     tel_table.add_column("Metric", style="cyan")
     tel_table.add_column("Current Run", style="white")
@@ -113,17 +111,15 @@ def render_tui_layout(
 
     tel_table.add_row("Step Time (ms)", c_step, b_step)
     tel_table.add_row("Throughput (smp/s)", c_tput, b_tput)
-    tel_table.add_row("Peak Compute (GFLOPS)", f"{current_metrics.get('peak_gflops', 0):.1f}", f"{best_metrics.get('peak_gflops', 0):.1f}")
-    tel_table.add_row("Mem Bandwidth (GB/s)", f"{current_metrics.get('avg_bandwidth_gbps', 0):.1f}", f"{best_metrics.get('avg_bandwidth_gbps', 0):.1f}")
+    tel_table.add_row("Arithmetic Intensity", f"{current_metrics.get('arithmetic_intensity', 0):.2f}", f"{best_metrics.get('arithmetic_intensity', 0):.2f}")
     tel_table.add_row("Memory Stall Pct", c_stall, b_stall)
     tel_table.add_row("Optimizer Status", Text(status_str, style=status_style), best_metrics.get("status", "-"))
 
     layout["telemetry_panel"].update(Panel(tel_table, border_style="magenta"))
 
-    # 4. History Table
-    hist_table = Table(title="Trial History", show_header=True, header_style="bold cyan", expand=True)
+    hist_table = Table(title="Optimization Phase History", show_header=True, header_style="bold cyan", expand=True)
     hist_table.add_column("#", style="dim", width=4)
-    hist_table.add_column("Applied Change", style="yellow")
+    hist_table.add_column("Phase & Change", style="yellow")
     hist_table.add_column("Step Time", style="white")
     hist_table.add_column("Throughput", style="bold cyan")
     hist_table.add_column("Stall Pct", style="magenta")
@@ -145,61 +141,41 @@ def render_tui_layout(
 
 
 def propose_next_config(current_config: dict[str, Any], metrics: dict[str, Any], trial: int) -> tuple[dict[str, Any], str]:
-    """Decision engine selecting next candidate hyperparameter configuration based on memory-bound stall analysis."""
+    """4-Phase Decision Engine."""
     next_cfg = copy.deepcopy(current_config)
-    status = metrics.get("status", "UNKNOWN")
-    stall_pct = metrics.get("memory_bound_kernel_pct", 0.0)
-    nan_detected = metrics.get("nan_detected", False)
 
-    # Strategy 1: Precision Compression
+    # Phase 1: Precision Unlock
     if trial == 1:
-        next_cfg["DEFAULT_FLOAT"] = "HALF"
-        next_cfg["ALLOW_TF32"] = 1
-        return next_cfg, "Lever 1: Compress precision to HALF (ALLOW_TF32=1)"
-
-    if trial == 2 and nan_detected:
         next_cfg["DEFAULT_FLOAT"] = "BFLOAT16"
         next_cfg["ALLOW_TF32"] = 1
-        return next_cfg, "Lever 1: Switch to BFLOAT16 (numerical stability)"
+        return next_cfg, "Phase 1: BFLOAT16 + ALLOW_TF32 Precision Unlock"
 
-    # Strategy 2: Scale BATCH_SIZE if MEMORY_BOUND or stall_pct > 30%
-    cur_bs = next_cfg.get("BATCH_SIZE", 64)
-    if status == "MEMORY_BOUND" or stall_pct > 30.0 or trial in [3, 4]:
-        if cur_bs < 512:
-            new_bs = cur_bs * 2
-            next_cfg["BATCH_SIZE"] = new_bs
-            next_cfg["MICROBATCH_SIZE"] = new_bs
-            return next_cfg, f"Lever 2: Scale BATCH_SIZE {cur_bs} -> {new_bs} (overcome VRAM latency)"
+    # Phase 2: Micro-batch scaling handled in harness sweep or trial 2
+    if trial == 2:
+        return next_cfg, "Phase 2: Micro-Batch Saturation Locked"
 
-    # Strategy 3: BEAM Compiler Search
+    # Phase 3: BEAM Search on locked micro-batch shape
     cur_beam = next_cfg.get("BEAM", 0)
-    if cur_beam == 0:
-        next_cfg["BEAM"] = 2
-        return next_cfg, "Lever 3: Set BEAM=2 (search L1/L2 cache locality)"
-    elif cur_beam == 2:
+    if trial == 3 or cur_beam == 0:
         next_cfg["BEAM"] = 4
-        return next_cfg, "Lever 3: Set BEAM=4 (search loop unrolling & upcasting)"
-    elif cur_beam == 4:
+        return next_cfg, "Phase 3: BEAM=4 Layout Search (L1/L2 cache tiling)"
+    elif trial == 4 or cur_beam == 4:
         next_cfg["BEAM"] = 8
-        return next_cfg, "Lever 3: Set BEAM=8 (deep kernel layout search)"
+        return next_cfg, "Phase 3: BEAM=8 Layout Search"
 
-    # Strategy 4: Microbatch / Grad Accumulation tuning
-    cur_micro = next_cfg.get("MICROBATCH_SIZE", cur_bs)
-    if cur_bs > 128 and cur_micro == cur_bs:
-        next_cfg["MICROBATCH_SIZE"] = cur_bs // 2
-        next_cfg["GRAD_ACCUMULATION_STEPS"] = 2
-        return next_cfg, f"Lever 4: Split MICROBATCH_SIZE to {cur_bs // 2} (grad accum x2)"
+    # Phase 4: SwiGLU Activation Fusion
+    if trial == 5 and next_cfg.get("USE_SWIGLU", 0) == 0:
+        next_cfg["USE_SWIGLU"] = 1
+        return next_cfg, "Phase 4: SwiGLU Activation Fusion (Higher Arithmetic Intensity)"
 
-    # Default fallback
-    next_cfg["BATCH_SIZE"] = cur_bs + 32
-    next_cfg["MICROBATCH_SIZE"] = next_cfg["BATCH_SIZE"]
-    return next_cfg, f"Increment BATCH_SIZE to {next_cfg['BATCH_SIZE']}"
+    return next_cfg, "Phase 4 Completed"
 
 
 def main():
     parser = argparse.ArgumentParser(description="Automated Memory-Bound Optimization Loop with TUI Visualizer")
-    parser.add_argument("--max-steps", type=int, default=8, help="Maximum number of optimization trials")
+    parser.add_argument("--max-steps", type=int, default=6, help="Maximum number of optimization trials")
     parser.add_argument("--tui", "--viz", dest="use_tui", action="store_true", default=False, help="Enable interactive TUI dashboard visualizer")
+    parser.add_argument("--skip-sweep", action="store_true", default=False, help="Skip Phase 2 micro-batch discovery sweep")
     args = parser.parse_args()
 
     config_path = "config.json"
@@ -209,41 +185,46 @@ def main():
     active_config = load_json(
         config_path,
         {
-            "BEAM": 0,
+            "MICRO_BATCH_SIZE": 64,
+            "GRAD_ACCUMULATION_STEPS": 4,
+            "DEFAULT_FLOAT": "BFLOAT16",
             "ALLOW_TF32": 1,
-            "DEFAULT_FLOAT": "FLOAT",
+            "BEAM": 0,
             "JIT": 1,
-            "BATCH_SIZE": 64,
-            "MICROBATCH_SIZE": 64,
-            "GRAD_ACCUMULATION_STEPS": 1,
+            "USE_SWIGLU": 0,
             "SEQUENCE_LENGTH": 256,
             "LEARNING_RATE": 1e-3,
             "NUM_STEPS": 20,
         },
     )
 
-    print("🚀 Starting Automated Optimization Loop...")
-    print("Baseline Run...")
+    print("🚀 Starting 4-Phase Automated Optimization Loop...")
+    print("\n--- Phase 1: Precision & Baseline Verification ---")
+    active_config["DEFAULT_FLOAT"] = "BFLOAT16"
+    active_config["ALLOW_TF32"] = 1
     save_json(config_path, active_config)
     baseline_metrics = run_harness(config_path)
+
+    # Phase 2: OOM-Safe Micro-Batch Sweep
+    if not args.skip_sweep:
+        print("\n--- Phase 2: OOM-Safe Micro-Batch Saturation Sweep ---")
+        find_optimal_batch_size(active_config, target_effective_batch=256)
+        active_config = load_json(config_path, active_config)
 
     best_config = copy.deepcopy(active_config)
     best_metrics = copy.deepcopy(baseline_metrics)
     best_tput = compute_throughput(best_config, best_metrics)
-
     save_json(best_config_path, best_config)
 
     history = [
         {
             "trial": 0,
-            "change": "Baseline",
+            "change": "Phase 1 & 2 Saturation",
             "metrics": baseline_metrics,
             "throughput": best_tput,
-            "outcome": "BASELINE",
+            "outcome": "LOCKED",
         }
     ]
-
-    consecutive_non_improving = 0
 
     if args.use_tui and RICH_AVAILABLE:
         console = Console()
@@ -266,7 +247,6 @@ def main():
             candidate_tput = compute_throughput(candidate_config, metrics)
             nan_detected = metrics.get("nan_detected", False)
 
-            # Decision Logic: Accept if throughput improved & no NaNs
             is_improvement = (candidate_tput > best_tput * 1.02) and not nan_detected
 
             if is_improvement:
@@ -276,11 +256,9 @@ def main():
                 active_config = copy.deepcopy(candidate_config)
                 save_json(best_config_path, best_config)
                 outcome = "✅ ACCEPTED"
-                consecutive_non_improving = 0
             else:
                 outcome = "❌ REJECTED (NaN)" if nan_detected else "⚠️ REJECTED (No Speedup)"
-                save_json(config_path, best_config)  # Revert config
-                consecutive_non_improving += 1
+                save_json(config_path, best_config)
 
             history.append(
                 {
@@ -295,16 +273,12 @@ def main():
             if live:
                 live.update(render_tui_layout(trial, args.max_steps, active_config, best_config, metrics, best_metrics, history))
 
-            if consecutive_non_improving >= 3:
-                print(f"\nOptimization converged. Reached plateau after {trial} iterations.")
-                break
-
     finally:
         if live:
             live.stop()
 
     print("\n=======================================================")
-    print("🏆 AUTOMATED OPTIMIZATION LOOP COMPLETE!")
+    print("🏆 4-PHASE AUTOMATED OPTIMIZATION COMPLETE!")
     print("=======================================================")
     print(f"Best Throughput: {best_tput:.1f} samples/sec")
     print(f"Best Configuration saved to '{best_config_path}':")

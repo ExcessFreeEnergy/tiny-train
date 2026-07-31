@@ -1,13 +1,17 @@
 {
-  "step_time_ms": 2035.248,
-  "peak_gflops": 1408.4,
-  "avg_bandwidth_gbps": 0.1,
-  "final_loss": 6.133,
+  "step_time_ms": 4598.87,
+  "peak_gflops": 1416.8,
+  "avg_bandwidth_gbps": 1469.3,
+  "final_loss": 6.0497,
   "nan_detected": false,
   "jit_active": true,
-  "total_kernels": 617,
-  "mem_bound_kernels": 178,
-  "memory_bound_kernel_pct": 28.8,
-  "arithmetic_intensity": 6.68,
-  "status": "COMPUTE_OPTIMIZED"
+  "micro_batch_size": 64,
+  "grad_accumulation_steps": 4,
+  "effective_batch_size": 256,
+  "total_kernels": 1617,
+  "mem_bound_kernels": 438,
+  "memory_bound_kernel_pct": 27.1,
+  "arithmetic_intensity": 7.29,
+  "status": "COMPUTE_OPTIMIZED",
+  "oom_detected": false
 }
