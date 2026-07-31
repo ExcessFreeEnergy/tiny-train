@@ -1,8 +1,8 @@
 [project]
 name = "tiny-train"
 version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.14"
+description = "High-Performance Tinygrad 15M Parameter Transformer Training Harness"
+requires-python = ">=3.11"
 dependencies = [
     "gigatoken",
     "huggingface-hub>=1.26.0",
@@ -16,3 +16,17 @@ members = [
 
 [tool.uv.sources]
 gigatoken = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.1",
+]
+
+[tool.ruff]
+line-length = 160
+target-version = "py310"
+exclude = ["gigatoken"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

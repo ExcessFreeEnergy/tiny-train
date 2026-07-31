@@ -30,10 +30,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-import numpy as np
 import awkward as ak
+import numpy as np
 
 
 def ensure_gigatoken_installed(force_rebuild: bool = False, submodule_dir: str = "gigatoken"):
@@ -42,6 +41,7 @@ def ensure_gigatoken_installed(force_rebuild: bool = False, submodule_dir: str =
     if not force_rebuild:
         try:
             import gigatoken as gt
+
             # Quick check to ensure rust backend gigatoken_rs is loaded & functional
             _ = gt.BPETokenizer
             is_installed = True
@@ -87,29 +87,29 @@ def ensure_gigatoken_installed(force_rebuild: bool = False, submodule_dir: str =
     print("Gigatoken compilation and installation successful.")
 
 
-def get_eos_token_id(tokenizer, user_eos_id: Optional[int]) -> Optional[int]:
+def get_eos_token_id(tokenizer, user_eos_id: int | None) -> int | None:
     """Determine the EOS token ID for the given tokenizer."""
     if user_eos_id is not None:
         return user_eos_id
-    
+
     specials = tokenizer._special_tokens()
     # Common EOS token strings
     for candidate in ["<|endoftext|>", "<|end_of_text|>", "</s>", "<eos>", "<|eos|>"]:
         if candidate in specials:
             return specials[candidate]
-    
+
     # Fallback to backend special tokens or vocab lookups if available
     for tok_id, tok_bytes in tokenizer.vocab.items():
         if tok_bytes in [b"<|endoftext|>", b"<|end_of_text|>", b"</s>", b"<eos>", b"<|eos|>"]:
             return tok_id
-            
+
     return None
 
 
 def create_file_source(
-    paths: List[str],
+    paths: list[str],
     file_type: str,
-    separator: Optional[str],
+    separator: str | None,
     json_field: str,
     parquet_column: str,
     gt_module,
@@ -126,49 +126,49 @@ def create_file_source(
         raise ValueError(f"Unsupported file type: {file_type}")
 
 
-def flatten_tokens_with_eos(tokens: ak.Array, eos_id: Optional[int], dtype: np.dtype) -> np.ndarray:
+def flatten_tokens_with_eos(tokens: ak.Array, eos_id: int | None, dtype: np.dtype) -> np.ndarray:
     """Flatten an awkward array of document tokens into a 1D numpy array, optionally inserting EOS."""
     doc_lens = ak.to_numpy(ak.num(tokens))
     num_docs = len(doc_lens)
     flat_raw = ak.to_numpy(ak.flatten(tokens))
-    
+
     if eos_id is None:
         return flat_raw.astype(dtype, copy=False)
-    
+
     total_tokens = np.sum(doc_lens, dtype=np.int64) + num_docs
     result = np.full(total_tokens, eos_id, dtype=dtype)
-    
+
     # Compute output boundaries for vectorized copy
     ends = np.cumsum(doc_lens + 1)
     indices = np.ones(total_tokens, dtype=bool)
     indices[ends - 1] = False
     result[indices] = flat_raw.astype(dtype, copy=False)
-    
+
     return result
 
 
 def build_trimmed_vocab_map(
     flat_tokens: np.ndarray,
     orig_vocab_size: int,
-    always_keep_ids: Optional[List[int]] = None,
-) -> Tuple[np.ndarray, Dict[int, int]]:
+    always_keep_ids: list[int] | None = None,
+) -> tuple[np.ndarray, dict[int, int]]:
     """Build a trimmed vocabulary mapping from a 1D array of token IDs.
-    
+
     Returns:
         new_to_orig: 1D uint32 array mapping new token ID -> original token ID
         orig_to_new: dict mapping original token ID -> new token ID
     """
     max_token_id = int(flat_tokens.max()) if len(flat_tokens) > 0 else 0
     actual_vocab_size = max(orig_vocab_size, max_token_id + 1)
-    
+
     counts = np.bincount(flat_tokens, minlength=actual_vocab_size)
     used_mask = counts > 0
-    
+
     if always_keep_ids:
         for k_id in always_keep_ids:
             if k_id is not None and 0 <= k_id < actual_vocab_size:
                 used_mask[k_id] = True
-                
+
     new_to_orig = np.where(used_mask)[0].astype(np.uint32)
     orig_to_new = {int(orig_id): int(new_id) for new_id, orig_id in enumerate(new_to_orig)}
     return new_to_orig, orig_to_new
@@ -176,23 +176,23 @@ def build_trimmed_vocab_map(
 
 def remap_tokens_to_trimmed(
     flat_tokens: np.ndarray,
-    orig_to_new: Dict[int, int],
+    orig_to_new: dict[int, int],
     orig_vocab_size: int,
     target_dtype: np.dtype,
 ) -> np.ndarray:
     """Remap tokens from original token IDs to trimmed token IDs using a numpy lookup table."""
     max_token_id = int(flat_tokens.max()) if len(flat_tokens) > 0 else 0
     lut_size = max(orig_vocab_size, max_token_id + 1)
-    
+
     lut = np.zeros(lut_size, dtype=target_dtype)
     for orig_id, new_id in orig_to_new.items():
         if orig_id < lut_size:
             lut[orig_id] = new_id
-            
+
     return lut[flat_tokens]
 
 
-def save_vocab_map(filepath: str, orig_to_new: Dict[int, int], new_to_orig: np.ndarray, orig_vocab_size: int):
+def save_vocab_map(filepath: str, orig_to_new: dict[int, int], new_to_orig: np.ndarray, orig_vocab_size: int):
     """Save vocabulary mapping metadata to JSON file."""
     data = {
         "original_vocab_size": orig_vocab_size,
@@ -208,9 +208,9 @@ def save_vocab_map(filepath: str, orig_to_new: Dict[int, int], new_to_orig: np.n
     print(f"Saved vocabulary mapping to '{filepath}'")
 
 
-def load_vocab_map(filepath: str) -> Tuple[Dict, Dict[int, int], np.ndarray]:
+def load_vocab_map(filepath: str) -> tuple[dict, dict[int, int], np.ndarray]:
     """Load vocabulary mapping metadata from JSON file."""
-    with open(filepath, "r") as f:
+    with open(filepath) as f:
         data = json.load(f)
     new_to_orig = np.array(data["new_to_orig"], dtype=np.uint32)
     orig_to_new = {int(k): int(v) for k, v in data["orig_to_new"].items()}
@@ -223,29 +223,34 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "-i", "--inputs",
+        "-i",
+        "--inputs",
         nargs="+",
         required=True,
         help="Input path(s) or glob patterns (e.g. data/*.txt)",
     )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         required=True,
         help="Output destination path (e.g. dataset.bin, dataset.npy, dataset.parquet)",
     )
     parser.add_argument(
-        "-t", "--tokenizer",
+        "-t",
+        "--tokenizer",
         default="openai-community/gpt2",
         help="HuggingFace model ID or path to tokenizer",
     )
     parser.add_argument(
-        "-f", "--file-type",
+        "-f",
+        "--file-type",
         choices=["auto", "text", "jsonl", "parquet"],
         default="auto",
         help="Input format (auto detects based on extension)",
     )
     parser.add_argument(
-        "-s", "--separator",
+        "-s",
+        "--separator",
         default="<|endoftext|>",
         help="Separator for plain text files (use 'none' for no split)",
     )
@@ -302,7 +307,8 @@ def main():
         help="Token ID integer type for bin/npy output (auto selects uint16 if vocab <= 65535)",
     )
     parser.add_argument(
-        "--force-rebuild", "--rebuild-gigatoken",
+        "--force-rebuild",
+        "--rebuild-gigatoken",
         dest="force_rebuild",
         action="store_true",
         default=False,
@@ -325,7 +331,7 @@ def main():
             resolved_paths.append(pattern)
         else:
             print(f"Warning: input pattern/path '{pattern}' did not match any files.", file=sys.stderr)
-            
+
     if not resolved_paths:
         print("Error: No valid input files found.", file=sys.stderr)
         sys.exit(1)
@@ -387,7 +393,7 @@ def main():
     toks_per_sec = raw_tok_count / tok_duration if tok_duration > 0 else 0
 
     print(f"Tokenization Complete in {tok_duration:.3f}s!")
-    print(f"  - Speed: {mb_per_sec:.2f} MB/s ({toks_per_sec/1e6:.2f} Mtok/s)")
+    print(f"  - Speed: {mb_per_sec:.2f} MB/s ({toks_per_sec / 1e6:.2f} Mtok/s)")
     print(f"  - Documents: {num_docs:,}")
     print(f"  - Tokens (raw): {raw_tok_count:,}")
 

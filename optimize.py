@@ -14,22 +14,19 @@ import argparse
 import copy
 import json
 import os
-import sys
-import time
-from pathlib import Path
-from typing import Dict, Any
+from typing import Any
 
 from harness import run_harness
 
 # Import rich components for live TUI
 try:
     from rich.console import Console
-    from rich.live import Live
-    from rich.table import Table
-    from rich.panel import Panel
     from rich.layout import Layout
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
     from rich.text import Text
-    from rich.style import Style
+
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
@@ -37,7 +34,7 @@ except ImportError:
 
 def load_json(filepath: str, fallback: dict) -> dict:
     if os.path.exists(filepath):
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             return json.load(f)
     return fallback
 
@@ -147,7 +144,7 @@ def render_tui_layout(
     return layout
 
 
-def propose_next_config(current_config: dict, metrics: dict, trial: int) -> Tuple_Config_Change:
+def propose_next_config(current_config: dict[str, Any], metrics: dict[str, Any], trial: int) -> tuple[dict[str, Any], str]:
     """Decision engine selecting next candidate hyperparameter configuration based on memory-bound stall analysis."""
     next_cfg = copy.deepcopy(current_config)
     status = metrics.get("status", "UNKNOWN")
@@ -159,7 +156,7 @@ def propose_next_config(current_config: dict, metrics: dict, trial: int) -> Tupl
         next_cfg["DEFAULT_FLOAT"] = "HALF"
         next_cfg["ALLOW_TF32"] = 1
         return next_cfg, "Lever 1: Compress precision to HALF (ALLOW_TF32=1)"
-    
+
     if trial == 2 and nan_detected:
         next_cfg["DEFAULT_FLOAT"] = "BFLOAT16"
         next_cfg["ALLOW_TF32"] = 1
@@ -199,10 +196,6 @@ def propose_next_config(current_config: dict, metrics: dict, trial: int) -> Tupl
     return next_cfg, f"Increment BATCH_SIZE to {next_cfg['BATCH_SIZE']}"
 
 
-class Tuple_Config_Change:
-    pass
-
-
 def main():
     parser = argparse.ArgumentParser(description="Automated Memory-Bound Optimization Loop with TUI Visualizer")
     parser.add_argument("--max-steps", type=int, default=8, help="Maximum number of optimization trials")
@@ -213,18 +206,21 @@ def main():
     best_config_path = "best_config.json"
 
     # Baseline configuration
-    active_config = load_json(config_path, {
-        "BEAM": 0,
-        "ALLOW_TF32": 1,
-        "DEFAULT_FLOAT": "FLOAT",
-        "JIT": 1,
-        "BATCH_SIZE": 64,
-        "MICROBATCH_SIZE": 64,
-        "GRAD_ACCUMULATION_STEPS": 1,
-        "SEQUENCE_LENGTH": 256,
-        "LEARNING_RATE": 1e-3,
-        "NUM_STEPS": 20,
-    })
+    active_config = load_json(
+        config_path,
+        {
+            "BEAM": 0,
+            "ALLOW_TF32": 1,
+            "DEFAULT_FLOAT": "FLOAT",
+            "JIT": 1,
+            "BATCH_SIZE": 64,
+            "MICROBATCH_SIZE": 64,
+            "GRAD_ACCUMULATION_STEPS": 1,
+            "SEQUENCE_LENGTH": 256,
+            "LEARNING_RATE": 1e-3,
+            "NUM_STEPS": 20,
+        },
+    )
 
     print("🚀 Starting Automated Optimization Loop...")
     print("Baseline Run...")
@@ -237,19 +233,23 @@ def main():
 
     save_json(best_config_path, best_config)
 
-    history = [{
-        "trial": 0,
-        "change": "Baseline",
-        "metrics": baseline_metrics,
-        "throughput": best_tput,
-        "outcome": "BASELINE",
-    }]
+    history = [
+        {
+            "trial": 0,
+            "change": "Baseline",
+            "metrics": baseline_metrics,
+            "throughput": best_tput,
+            "outcome": "BASELINE",
+        }
+    ]
 
     consecutive_non_improving = 0
 
     if args.use_tui and RICH_AVAILABLE:
         console = Console()
-        live = Live(render_tui_layout(0, args.max_steps, active_config, best_config, baseline_metrics, best_metrics, history), refresh_per_second=4, console=console)
+        live = Live(
+            render_tui_layout(0, args.max_steps, active_config, best_config, baseline_metrics, best_metrics, history), refresh_per_second=4, console=console
+        )
         live.start()
     else:
         live = None
@@ -282,13 +282,15 @@ def main():
                 save_json(config_path, best_config)  # Revert config
                 consecutive_non_improving += 1
 
-            history.append({
-                "trial": trial,
-                "change": change_desc,
-                "metrics": metrics,
-                "throughput": candidate_tput,
-                "outcome": outcome,
-            })
+            history.append(
+                {
+                    "trial": trial,
+                    "change": change_desc,
+                    "metrics": metrics,
+                    "throughput": candidate_tput,
+                    "outcome": outcome,
+                }
+            )
 
             if live:
                 live.update(render_tui_layout(trial, args.max_steps, active_config, best_config, metrics, best_metrics, history))

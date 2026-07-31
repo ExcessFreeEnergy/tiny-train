@@ -14,7 +14,7 @@ import time
 
 def load_config(config_path: str = "config.json") -> dict:
     if os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             return json.load(f)
     return {
         "BEAM": 0,
@@ -33,7 +33,7 @@ def load_config(config_path: str = "config.json") -> dict:
 def parse_telemetry_from_output(output_text: str) -> dict:
     """Parse JSON telemetry block and scan tinygrad DEBUG=2 kernel lines for Arithmetic Intensity."""
     base_metrics = {}
-    
+
     # 1. Parse JSON block from train.py if present
     match = re.search(r"=== HARNESS TELEMETRY METRICS ===\s*(\{.*?\})\s*=================================", output_text, re.DOTALL)
     if match:
@@ -45,7 +45,7 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     # 2. Kernel-level DEBUG=2 parsing for Arithmetic Intensity & Stall Detection
     # Example format: "... 0.12 ms ... 1500.2 GFLOPS ... 850.4 GB/s"
     kernel_regex = re.compile(r"(\d+\.\d+|\d+)\s*ms.*?\s*(\d+\.\d+|\d+)\s*GFLOPS.*?\s*(\d+\.\d+|\d+)\s*GB/s")
-    
+
     total_time_ms = 0.0
     mem_bound_kernels = 0
     total_kernels = 0
@@ -67,10 +67,12 @@ def parse_telemetry_from_output(output_text: str) -> dict:
 
     # Fallbacks for step time & loss if JSON block missing
     nan_detected = "NaN/Inf detected" in output_text or "nan" in output_text.lower()
-    
+
     if "step_time_ms" not in base_metrics:
         step_times = [float(m) for m in re.findall(r"step_time=([0-9.]+)\s*ms", output_text)]
-        avg_step_ms = float(sum(step_times[2:]) / len(step_times[2:])) if len(step_times) > 2 else (float(sum(step_times) / len(step_times)) if step_times else 9999.0)
+        avg_step_ms = (
+            float(sum(step_times[2:]) / len(step_times[2:])) if len(step_times) > 2 else (float(sum(step_times) / len(step_times)) if step_times else 9999.0)
+        )
         base_metrics["step_time_ms"] = round(avg_step_ms, 3)
 
     if "final_loss" not in base_metrics:
@@ -87,19 +89,21 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     avg_gflops = sum(gflops_list) / max(1, len(gflops_list)) if gflops_list else base_metrics.get("peak_gflops", 0)
     avg_gbps = sum(gbps_list) / max(1, len(gbps_list)) if gbps_list else max(1.0, base_metrics.get("avg_bandwidth_gbps", 1.0))
     arithmetic_intensity = round(avg_gflops / max(1.0, avg_gbps), 2)
-    
+
     stall_ratio = round((mem_bound_kernels / max(1, total_kernels)) * 100.0, 1)
     status = "MEMORY_BOUND" if stall_ratio > 40.0 else "COMPUTE_OPTIMIZED"
 
-    base_metrics.update({
-        "total_kernels": total_kernels,
-        "mem_bound_kernels": mem_bound_kernels,
-        "memory_bound_kernel_pct": stall_ratio,
-        "arithmetic_intensity": arithmetic_intensity,
-        "status": status,
-        "nan_detected": base_metrics.get("nan_detected", nan_detected),
-        "jit_active": base_metrics.get("jit_active", "Warmup complete" in output_text),
-    })
+    base_metrics.update(
+        {
+            "total_kernels": total_kernels,
+            "mem_bound_kernels": mem_bound_kernels,
+            "memory_bound_kernel_pct": stall_ratio,
+            "arithmetic_intensity": arithmetic_intensity,
+            "status": status,
+            "nan_detected": base_metrics.get("nan_detected", nan_detected),
+            "jit_active": base_metrics.get("jit_active", "Warmup complete" in output_text),
+        }
+    )
 
     return base_metrics
 
@@ -133,7 +137,7 @@ def run_harness(config_path: str = "config.json") -> dict:
     t1 = time.time()
 
     print(f"Subprocess completed with return code {proc.returncode} in {t1 - t0:.2f}s")
-    
+
     if proc.returncode != 0 and "NaN/Inf detected" not in stderr:
         print(f"Error during execution:\n{stderr[-2000:]}")
 

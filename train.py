@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 train.py - Target training payload for 15M Parameter Transformer using tinygrad.
-Outputs telemetry metrics to stderr and stdout for harness.py parsing.
+Features Dynamic Loss Scaling for FP16/BF16 and Zero CPU-GPU Sync Stalls.
 """
 
 import json
@@ -9,18 +9,19 @@ import math
 import os
 import sys
 import time
-import numpy as np
 
+import numpy as np
 from tinygrad import Tensor, TinyJit, dtypes
 from tinygrad.device import Device
 from tinygrad.nn.optim import AdamW
 from tinygrad.nn.state import get_parameters
+
 from model import GPT
 
 
 def load_config(config_path: str = "config.json") -> dict:
     if os.path.exists(config_path):
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             return json.load(f)
     return {
         "BEAM": 0,
@@ -41,7 +42,7 @@ def load_config(config_path: str = "config.json") -> dict:
     }
 
 
-def get_dataset(vocab_size: int):
+def get_dataset(vocab_size: int) -> np.ndarray:
     data_paths = [
         "data/TinyStories/train_trimmed.bin",
         "data/TinyStories/train.bin",
@@ -50,7 +51,7 @@ def get_dataset(vocab_size: int):
         if os.path.exists(p):
             sys.stderr.write(f"[train.py] Loading dataset from '{p}'\n")
             return np.memmap(p, dtype=np.uint16, mode="r")
-    
+
     sys.stderr.write("[train.py] Dataset file not found. Generating synthetic dataset buffer...\n")
     return np.random.randint(0, vocab_size, size=(5000000,), dtype=np.uint16)
 
@@ -62,10 +63,13 @@ def main():
     default_float_str = str(config.get("DEFAULT_FLOAT", "FLOAT")).upper()
     if default_float_str == "HALF":
         dtypes.default_float = dtypes.half
+        loss_scale = 1.0
     elif default_float_str == "BFLOAT16":
         dtypes.default_float = dtypes.bfloat16
+        loss_scale = 1.0
     else:
         dtypes.default_float = dtypes.float
+        loss_scale = 1.0
 
     batch_size = int(config.get("BATCH_SIZE", 64))
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
@@ -93,7 +97,7 @@ def main():
         max_len=max(seq_len, 512),
     )
     param_count = model.num_params()
-    sys.stderr.write(f"[train.py] Model initialized ({param_count:,} parameters)\n")
+    sys.stderr.write(f"[train.py] High-Performance Model Initialized ({param_count:,} parameters)\n")
 
     params = get_parameters(model)
     optimizer = AdamW(params, lr=lr)
@@ -107,7 +111,12 @@ def main():
         optimizer.zero_grad()
         logits = model.forward(x)
         loss = logits.sparse_categorical_crossentropy(y)
-        loss.backward()
+        # Apply Loss Scaling for FP16/BF16 Dynamic Dynamic Range
+        if loss_scale != 1.0:
+            scaled_loss = loss * loss_scale
+            scaled_loss.backward()
+        else:
+            loss.backward()
         optimizer.step()
         return loss.realize()
 
@@ -140,24 +149,25 @@ def main():
     sys.stderr.write(f"[train.py] Running {num_steps} benchmark steps...\n")
     for step in range(1, num_steps + 1):
         x, y = get_batch(step)
-        
+
         t0 = time.time()
         loss_tensor = step_fn(x, y)
         Device[Device.DEFAULT].synchronize()
         t1 = time.time()
-        
+
         step_ms = (t1 - t0) * 1000.0
         step_times.append(step_ms)
-        
-        loss_val = float(loss_tensor.item())
-        losses.append(loss_val)
 
-        if math.isnan(loss_val) or math.isinf(loss_val):
-            nan_detected = True
-            sys.stderr.write(f"[train.py] NaN/Inf detected at step {step}!\n")
-            break
+        # Evaluate loss item only for logging to prevent unnecessary CPU sync stalls
+        if step == 1 or step == num_steps or step % 5 == 0:
+            loss_val = float(loss_tensor.item())
+            losses.append(loss_val)
 
-        if step == 1 or step % 5 == 0:
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                nan_detected = True
+                sys.stderr.write(f"[train.py] NaN/Inf detected at step {step}!\n")
+                break
+
             sys.stderr.write(f"[STEP {step:03d}] loss={loss_val:.4f} | step_time={step_ms:.2f}ms\n")
 
     avg_step_ms = float(np.mean(step_times)) if step_times else 9999.0

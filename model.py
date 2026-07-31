@@ -1,23 +1,25 @@
 """
-model.py - 15M Parameter Transformer Architecture in tinygrad.
+model.py - High-Performance 15M Parameter Transformer Architecture in tinygrad.
+Uses RMSNorm, Fused Scaled Dot-Product Attention (FlashAttention), and pure functional graph execution.
 """
 
-import math
-from typing import Optional
 from tinygrad import Tensor, dtypes
 
 
-class LayerNorm:
+class RMSNorm:
+    """Root Mean Square Layer Normalization (fuses into single-pass reduction)."""
+
     def __init__(self, dim: int, eps: float = 1e-5):
         self.weight = Tensor.ones(dim)
-        self.bias = Tensor.zeros(dim)
         self.eps = eps
 
     def __call__(self, x: Tensor) -> Tensor:
-        return x.layernorm(eps=self.eps).mul(self.weight).add(self.bias)
+        return (x * (x.pow(2).mean(-1, keepdim=True) + self.eps).rsqrt()) * self.weight
 
 
 class CausalSelfAttention:
+    """Fused Scaled Dot-Product Causal Self-Attention (FlashAttention)."""
+
     def __init__(self, d_model: int, n_heads: int):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
@@ -25,22 +27,22 @@ class CausalSelfAttention:
         self.c_proj = Tensor.glorot_uniform(d_model, d_model)
 
     def __call__(self, x: Tensor) -> Tensor:
-        B, T, C = x.shape
+        b, t, c = x.shape
         qkv = x @ self.c_attn
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        q = q.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        att = (q @ k.transpose(-2, -1)) * scale
-        mask = Tensor.ones(T, T, dtype=dtypes.bool).triu(1).logical_not()
-        att = att.masked_fill(mask == False, -1e9).softmax()
-        y = (att @ v).transpose(1, 2).reshape(B, T, C)
+        # Fused Scaled Dot-Product Attention (SDPA / FlashAttention)
+        y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).reshape(b, t, c)
         return y @ self.c_proj
 
 
 class MLP:
+    """Feed-Forward Network with GELU activation."""
+
     def __init__(self, d_model: int, d_ff: int):
         self.c_fc = Tensor.glorot_uniform(d_model, d_ff)
         self.c_proj = Tensor.glorot_uniform(d_ff, d_model)
@@ -50,15 +52,17 @@ class MLP:
 
 
 class Block:
+    """Transformer Block with Pre-RMSNorm and Pre-Attention Residuals."""
+
     def __init__(self, d_model: int, n_heads: int, d_ff: int):
-        self.ln_1 = LayerNorm(d_model)
+        self.rms_1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads)
-        self.ln_2 = LayerNorm(d_model)
+        self.rms_2 = RMSNorm(d_model)
         self.mlp = MLP(d_model, d_ff)
 
     def __call__(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.rms_1(x))
+        x = x + self.mlp(self.rms_2(x))
         return x
 
 
@@ -79,26 +83,28 @@ class GPT:
         self.wte = Tensor.glorot_uniform(vocab_size, d_model)
         self.wpe = Tensor.glorot_uniform(max_len, d_model)
         self.h = [Block(d_model, n_heads, d_ff) for _ in range(n_layers)]
-        self.ln_f = LayerNorm(d_model)
+        self.rms_f = RMSNorm(d_model)
 
     def forward(self, idx: Tensor) -> Tensor:
-        B, T = idx.shape
-        pos = Tensor.arange(0, T, dtype=dtypes.int32)
+        b, t = idx.shape
+        pos = Tensor.arange(0, t, dtype=dtypes.int32)
         tok_emb = self.wte[idx]
         pos_emb = self.wpe[pos]
         x = tok_emb + pos_emb
         for block in self.h:
             x = block(x)
-        x = self.ln_f(x)
-        logits = x @ self.wte.T
+        x = self.rms_f(x)
+        # Compute logits with FP32 stability for large vocabulary cross-entropy
+        logits = x.cast(dtypes.float) @ self.wte.cast(dtypes.float).T
         return logits
 
     def num_params(self) -> int:
         from tinygrad.nn.state import get_state_dict
+
         state = get_state_dict(self)
         return sum(p.numel() for p in state.values())
 
 
 if __name__ == "__main__":
     model = GPT()
-    print(f"GPT Model Initialized. Total Parameters: {model.num_params():,}")
+    print(f"High-Performance GPT Model Initialized. Total Parameters: {model.num_params():,}")

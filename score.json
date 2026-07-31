@@ -1,13 +1,13 @@
 {
-  "step_time_ms": 4664.783,
-  "peak_gflops": 1229.3,
-  "avg_bandwidth_gbps": 2204.5,
-  "final_loss": 6.0439,
+  "step_time_ms": 2035.248,
+  "peak_gflops": 1408.4,
+  "avg_bandwidth_gbps": 0.1,
+  "final_loss": 6.133,
   "nan_detected": false,
   "jit_active": true,
-  "total_kernels": 748,
-  "mem_bound_kernels": 261,
-  "memory_bound_kernel_pct": 34.9,
-  "arithmetic_intensity": 3.07,
+  "total_kernels": 617,
+  "mem_bound_kernels": 178,
+  "memory_bound_kernel_pct": 28.8,
+  "arithmetic_intensity": 6.68,
   "status": "COMPUTE_OPTIMIZED"
 }
