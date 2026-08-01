@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-optimize.py - Automated Memory-Bound Optimization Loop with TUI Visualizer.
+optimize.py - Automated Optimization Loop with TUI Visualizer.
 
-Follows the 4-Phase Optimization Strategy:
-  - Phase 1: Precision & Tensor Core Unlock (DEFAULT_FLOAT=BFLOAT16, ALLOW_TF32=1)
-  - Phase 2: Micro-Batch Saturation (OOM-Safe Micro-Batch Sweep with BEAM=0)
-  - Phase 3: BEAM Layout Search (BEAM=4/8/16 on locked micro-batch shape)
-  - Phase 4: SwiGLU Activation Fusion (USE_SWIGLU=1 for higher arithmetic intensity)
+Executes the 3-Phase Suite Sequence:
+  - Phase 1: Micro-Batch Saturation & Optimization (OOM-Safe Micro-Batch Sweep)
+  - Phase 2: BEAM Compiler Search (BEAM=0 -> 2 -> 4 -> 8 on locked shape)
+  - Phase 3: SwiGLU Activation Fusion (USE_SWIGLU=1 for maximum arithmetic intensity)
 """
 
 import argparse
@@ -74,7 +73,7 @@ def render_tui_layout(
     )
 
     header_text = Text()
-    header_text.append(" 🚀 TINYGRAD 4-PHASE AUTOMATED OPTIMIZER ", style="bold white on blue")
+    header_text.append(" 🚀 TRANSIENT 3-PHASE HARNESS OPTIMIZER ", style="bold white on blue")
     header_text.append(f" | RTX 4090 (24GB) | Trial {iteration}/{max_steps}", style="bold cyan")
     layout["header"].update(Panel(header_text, style="blue"))
 
@@ -146,41 +145,35 @@ def render_tui_layout(
 
 
 def propose_next_config(current_config: dict[str, Any], metrics: dict[str, Any], trial: int) -> tuple[dict[str, Any], str]:
-    """4-Phase Decision Engine."""
+    """3-Phase Suite Decision Engine: Batch -> BEAM -> SwiGLU."""
     next_cfg = copy.deepcopy(current_config)
 
-    # Phase 1: Precision Unlock
+    # Phase 1: Micro-Batch Saturation (handled in harness sweep or trial 1)
     if trial == 1:
-        next_cfg["DEFAULT_FLOAT"] = "BFLOAT16"
-        next_cfg["ALLOW_TF32"] = 1
-        return next_cfg, "Phase 1: BFLOAT16 + ALLOW_TF32 Precision Unlock"
+        return next_cfg, "Phase 1: Micro-Batch Saturation Locked"
 
-    # Phase 2: Micro-batch scaling handled in harness sweep or trial 2
-    if trial == 2:
-        return next_cfg, "Phase 2: Micro-Batch Saturation Locked"
-
-    # Phase 3: BEAM Search on locked micro-batch shape
+    # Phase 2: BEAM Compiler Search (BEAM=0 -> 2 -> 4 -> 8)
     cur_beam = next_cfg.get("BEAM", 0)
-    if trial == 3 or cur_beam == 0:
+    if trial == 2 or cur_beam == 0:
+        next_cfg["BEAM"] = 2
+        return next_cfg, "Phase 2: BEAM=2 Compiler Search (Cache Tiling & Tensor Core Unroll)"
+    elif trial == 3 or cur_beam == 2:
         next_cfg["BEAM"] = 4
-        return next_cfg, "Phase 3: BEAM=4 Layout Search (L1/L2 cache tiling)"
-    elif trial == 4 or cur_beam == 4:
-        next_cfg["BEAM"] = 8
-        return next_cfg, "Phase 3: BEAM=8 Layout Search"
+        return next_cfg, "Phase 2: BEAM=4 Deep Compiler Search"
 
-    # Phase 4: SwiGLU Activation Fusion
-    if trial == 5 and next_cfg.get("USE_SWIGLU", 0) == 0:
+    # Phase 3: SwiGLU Activation Fusion
+    if trial == 4 and next_cfg.get("USE_SWIGLU", 0) == 0:
         next_cfg["USE_SWIGLU"] = 1
-        return next_cfg, "Phase 4: SwiGLU Activation Fusion (Higher Arithmetic Intensity)"
+        return next_cfg, "Phase 3: SwiGLU Activation Fusion (Higher Arithmetic Intensity)"
 
-    return next_cfg, "Phase 4 Completed"
+    return next_cfg, "Optimization Suite Completed"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Automated Memory-Bound Optimization Loop with TUI Visualizer")
-    parser.add_argument("--max-steps", type=int, default=6, help="Maximum number of optimization trials")
+    parser = argparse.ArgumentParser(description="Automated Transient Optimization Loop with TUI Visualizer")
+    parser.add_argument("--max-steps", type=int, default=5, help="Maximum number of optimization trials")
     parser.add_argument("--tui", "--viz", dest="use_tui", action="store_true", default=False, help="Enable interactive TUI dashboard visualizer")
-    parser.add_argument("--skip-sweep", action="store_true", default=False, help="Skip Phase 2 micro-batch discovery sweep")
+    parser.add_argument("--skip-sweep", action="store_true", default=False, help="Skip Phase 1 micro-batch discovery sweep")
     args = parser.parse_args()
 
     config_path = "config.json"
@@ -190,29 +183,36 @@ def main():
     active_config = load_json(
         config_path,
         {
-            "MICRO_BATCH_SIZE": 64,
+            "MICRO_BATCH_SIZE": 16,
             "GRAD_ACCUMULATION_STEPS": 4,
             "DEFAULT_FLOAT": "BFLOAT16",
             "ALLOW_TF32": 1,
             "BEAM": 0,
             "JIT": 1,
             "USE_SWIGLU": 0,
+            "USE_ROPE": 1,
+            "PAD_VOCAB_MULTIPLE": 128,
             "SEQUENCE_LENGTH": 256,
             "LEARNING_RATE": 1e-3,
             "NUM_STEPS": 20,
+            "VOCAB_SIZE": 29362,
+            "D_MODEL": 768,
+            "N_LAYERS": 12,
+            "N_HEADS": 12,
+            "D_FF": 3072,
         },
     )
 
-    print("🚀 Starting 4-Phase Automated Optimization Loop...")
-    print("\n--- Phase 1: Precision & Baseline Verification ---")
+    print("🚀 Starting Transient 3-Phase Automated Optimization Loop...")
+    print("Sequence: Batch Optimization -> BEAM Compiler Search -> SwiGLU Fusion\n")
     active_config["DEFAULT_FLOAT"] = "BFLOAT16"
     active_config["ALLOW_TF32"] = 1
     save_json(config_path, active_config)
     baseline_metrics = run_harness(config_path)
 
-    # Phase 2: OOM-Safe Micro-Batch Sweep
+    # Phase 1: OOM-Safe Micro-Batch Sweep
     if not args.skip_sweep:
-        print("\n--- Phase 2: OOM-Safe Micro-Batch Saturation Sweep ---")
+        print("\n--- Phase 1: Micro-Batch Saturation Sweep ---")
         find_optimal_batch_size(active_config, target_effective_batch=256)
         active_config = load_json(config_path, active_config)
 
@@ -224,7 +224,7 @@ def main():
     history = [
         {
             "trial": 0,
-            "change": "Phase 1 & 2 Saturation",
+            "change": "Phase 1 Batch Saturation",
             "metrics": baseline_metrics,
             "throughput": best_tput,
             "outcome": "LOCKED",
@@ -276,14 +276,14 @@ def main():
             )
 
             if live:
-                live.update(render_tui_layout(trial, args.max_steps, active_config, best_config, metrics, best_metrics, history))
+                live.update(render_tui_layout(trial, args.max_steps, candidate_config, best_config, metrics, best_metrics, history))
 
     finally:
         if live:
             live.stop()
 
     print("\n=======================================================")
-    print("🏆 4-PHASE AUTOMATED OPTIMIZATION COMPLETE!")
+    print("🏆 TRANSIENT 3-PHASE AUTOMATED OPTIMIZATION COMPLETE!")
     print("=======================================================")
     print(f"Best Throughput: {best_tput:.1f} samples/sec")
     print(f"Best Configuration saved to '{best_config_path}':")

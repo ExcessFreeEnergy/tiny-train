@@ -12,8 +12,8 @@
   "LEARNING_RATE": 0.001,
   "NUM_STEPS": 20,
   "VOCAB_SIZE": 29362,
-  "D_MODEL": 288,
-  "N_LAYERS": 6,
-  "N_HEADS": 6,
-  "D_FF": 1152
+  "D_MODEL": 768,
+  "N_LAYERS": 12,
+  "N_HEADS": 12,
+  "D_FF": 3072
 }

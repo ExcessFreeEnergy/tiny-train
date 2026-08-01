@@ -15,23 +15,27 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | **4. BEAM=2 Compiler Layout Tuning** | 15M | **`COMPUTE_OPTIMIZED`** | **611.37 ms** | **418.7** | **1,617** | **34.9%** | **5.30** | **10,657.4** | **3.23%** | **6.05** | ❌ No |
 | **5. 64/128 Alignment + Fused RoPE** | 15M | **`COMPUTE_OPTIMIZED`** | **1,036.74 ms** | **246.9** | **1,648** | **25.6%** | **9.30** | **6,237.3** | **1.89%** | **6.04** | ❌ No |
 | **6. 125M Target Model Validation** | **125M** | **`COMPUTE_OPTIMIZED`** | **2,161.10 ms** | **29.6** | **1,648** | **25.6%** | **9.30** | **6,180.7** | **1.87%** | **6.24** | ❌ No |
+| **7. Fused $W_{13}$ SwiGLU 125M Target** | **125M** | **`COMPUTE_OPTIMIZED`** | **1,499.18 ms** | **42.7** | **1,248** | **22.1%** | **11.40** | **8,909.6** | **2.70%** | **6.16** | ❌ No |
 
 ---
 
 ## 📊 Summary of Architectural Changes & Impact
 
-### Milestone 6: 125M Model Target Verification (`train_production.py`)
-*Date: 2026-07-31*
+### Milestone 7: Fused $W_{13}$ SwiGLU MLP Linear Projection (`model.py`)
+*Date: 2026-08-01*
 
 #### Changes Implemented:
-1. **125M Target Architecture Validation**:
-   - Model Parameters: **135,875,328 (135.8M)** ($d_{model}=768$, $n_{layers}=12$, $n_{heads}=12$, $d_{ff}=3072$, padded $vocab=29,440$).
-   - Micro-Batch Size: `MICRO_BATCH_SIZE=16`, `GRAD_ACCUMULATION_STEPS=4`.
+1. **Fused SwiGLU Linear Projections ($W_1$ & $W_3 \rightarrow W_{13}$)**:
+   - Merged separate `self.w1` and `self.w3` matrix projections in `SwiGLUMLP` into a single `self.w13 = Tensor.glorot_uniform(d_model, 2 * d_ff)` projection.
+   - Reduced GEMM kernel dispatch calls per step across 12 layers from 24 separate GEMM calls to 12 fused GEMMs.
 
-2. **Training & Convergence**:
-   - Training loss dropped rapidly from **8.0211 $\rightarrow$ 6.2427** in 5 steps.
-   - Validation loss evaluated at **6.1113**.
-   - Model checkpoints saved to `checkpoints/model_125m_step_5.safetensors`.
+2. **Clean Single-Step `@TinyJit` Scoping (`train_production.py`)**:
+   - Kept `@TinyJit` scoped strictly to single weight update steps (`step_fn(*inputs)`), consuming micro-batch data inputs without passing 150+ individual gradient accumulators through JIT inputs.
+
+3. **Performance Gains**:
+   - 125M parameter step time dropped from **2,161 ms $\rightarrow$ 1,499 ms**.
+   - Throughput increased to **42.7 samples/sec**.
+   - Validation loss evaluated at **6.0737**.
 
 ---
 

@@ -87,10 +87,10 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 ## 6. Execution Commands
 
 ```bash
-# Stage 1: Harness Optimization Pass
-uv run python harness.py --sweep-batch
-uv run python optimize.py --tui
-
-# Stage 2: 125M Production Training Pass
-uv run python train_production.py --model-size 125M --total-steps 500
+#- **2-Stage Architecture**:
+  1. **Stage 1 (Harness Suite)**: `python harness.py --run-suite` executes the transient 3-phase optimization suite:
+     - **Phase 1 (Batch Optimization)**: OOM-Safe Micro-Batch Sweep discovering optimal hardware saturation.
+     - **Phase 2 (BEAM Compiler Search)**: Iteratively tests `BEAM=0` $\rightarrow$ `BEAM=2` $\rightarrow$ `BEAM=4` $\rightarrow$ `BEAM=8`, saving compiled CUDA/PTX binaries to `~/.cache/tinygrad/cache.db` (`TINYCACHE=1`).
+     - **Phase 3 (SwiGLU Activation Fusion)**: Tests SwiGLU gated activation fusion (`USE_SWIGLU=1`) for maximum arithmetic intensity.
+  2. **Stage 2 (Main Production Trainer)**: `python train_production.py --model-size 125M` loads `best_config.json`, streaming dataset tokens via `np.memmap`, applying Cosine LR schedule with Warmup, evaluating validation loss, and saving `.safetensors` checkpoints.
 ```

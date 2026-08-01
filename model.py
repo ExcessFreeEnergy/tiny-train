@@ -78,15 +78,16 @@ class GELUMLP:
 
 
 class SwiGLUMLP:
-    """SwiGLU Gated Feed-Forward Network for Higher Arithmetic Intensity."""
+    """Fused SwiGLU Gated Feed-Forward Network for Higher Arithmetic Intensity."""
 
     def __init__(self, d_model: int, d_ff: int):
-        self.w1 = Tensor.glorot_uniform(d_model, d_ff)
+        self.w13 = Tensor.glorot_uniform(d_model, 2 * d_ff)
         self.w2 = Tensor.glorot_uniform(d_ff, d_model)
-        self.w3 = Tensor.glorot_uniform(d_model, d_ff)
 
     def __call__(self, x: Tensor) -> Tensor:
-        return ((x @ self.w1).silu() * (x @ self.w3)) @ self.w2
+        w13 = x @ self.w13
+        w1, w3 = w13.chunk(2, dim=-1)
+        return (w1.silu() * w3) @ self.w2
 
 
 class Block:
