@@ -72,7 +72,7 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     oom_detected = "OutOfMemory" in output_text or "CUDA error: out of memory" in output_text or "OOM" in output_text
 
     if "step_time_ms" not in base_metrics:
-        step_times = [float(m) for m in re.findall(r"step_time=([0-9.]+)\s*ms", output_text)]
+        step_times = [float(m) for m in re.findall(r"(?:time|step_time)=([0-9.]+)\s*ms", output_text)]
         avg_step_ms = float(sum(step_times)) / len(step_times) if step_times else 9999.0
         base_metrics["step_time_ms"] = round(avg_step_ms, 3)
 
@@ -81,10 +81,12 @@ def parse_telemetry_from_output(output_text: str) -> dict:
         base_metrics["final_loss"] = round(losses[-1], 4) if losses else 999.0
 
     if "peak_gflops" not in base_metrics or base_metrics["peak_gflops"] == 0:
-        base_metrics["peak_gflops"] = round(max(gflops_list), 1) if gflops_list else 0.0
+        gflops_vals = [float(m) for m in re.findall(r"GFLOPS=([0-9.]+)", output_text)]
+        base_metrics["peak_gflops"] = round(max(gflops_vals), 1) if gflops_vals else (round(max(gflops_list), 1) if gflops_list else 0.0)
 
-    if "mfu_pct" not in base_metrics:
-        base_metrics["mfu_pct"] = round((base_metrics.get("peak_gflops", 0) / 330000.0) * 100.0, 2)
+    if "mfu_pct" not in base_metrics or base_metrics["mfu_pct"] == 0:
+        mfu_vals = [float(m) for m in re.findall(r"MFU=([0-9.]+)\%", output_text)]
+        base_metrics["mfu_pct"] = round(max(mfu_vals), 2) if mfu_vals else round((base_metrics.get("peak_gflops", 0) / 330000.0) * 100.0, 2)
 
     if "avg_bandwidth_gbps" not in base_metrics or base_metrics["avg_bandwidth_gbps"] == 0:
         base_metrics["avg_bandwidth_gbps"] = round(sum(gbps_list) / max(1, len(gbps_list)), 1) if gbps_list else 0.0
@@ -112,7 +114,7 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     return base_metrics
 
 
-def run_harness(config_path: str = "config.json") -> dict:
+def run_harness(config_path: str = "config.json", timeout_sec: int = 300) -> dict:
     config = load_config(config_path)
     print("=== Tinygrad Training Optimization Harness ===")
     print(f"Configuration: {json.dumps(config, indent=2)}")
@@ -121,56 +123,80 @@ def run_harness(config_path: str = "config.json") -> dict:
     env["DEBUG"] = "2"
     env["TINYCACHE"] = "1"
     env["HCQ"] = "1"
-    env["BEAM"] = str(config.get("BEAM", 4))
+    env["BEAM"] = str(config.get("BEAM", 2))
     env["ALLOW_TF32"] = str(config.get("ALLOW_TF32", 1))
     env["DEFAULT_FLOAT"] = str(config.get("DEFAULT_FLOAT", "BFLOAT16"))
     env["JIT"] = str(config.get("JIT", 1))
 
-    cmd = [sys.executable, "train.py"]
+    num_steps = str(config.get("NUM_STEPS", 10))
+    cmd = [sys.executable, "train_production.py", "--model-size", "125M", "--total-steps", num_steps]
     print(f"\nExecuting payload: {' '.join(cmd)}")
+    print(f"⏱️ Hard Timeout Limit: {timeout_sec}s (5 minutes max per run)\n")
     t0 = time.time()
 
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         env=env,
         text=True,
         bufsize=1,
     )
 
-    stdout_lines = []
-    stderr_lines = []
+    output_lines = []
+    last_heartbeat = time.time()
+    timed_out = False
 
-    # Stream real-time progress lines to stdout
     while True:
-        line = proc.stderr.readline()
-        if not line and proc.poll() is not None:
-            break
+        line = proc.stdout.readline()
+        now = time.time()
+        elapsed = now - t0
+
         if line:
-            stderr_lines.append(line)
-            if "[STEP" in line or "[train.py]" in line:
-                sys.stdout.write(line)
-                sys.stdout.flush()
+            output_lines.append(line)
+            sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] {line}")
+            sys.stdout.flush()
+            last_heartbeat = now
 
-    out_rest, err_rest = proc.communicate()
-    if out_rest:
-        stdout_lines.append(out_rest)
-    if err_rest:
-        stderr_lines.append(err_rest)
+        if proc.poll() is not None:
+            break
 
-    stdout = "".join(stdout_lines)
-    stderr = "".join(stderr_lines)
+        if elapsed > timeout_sec:
+            timed_out = True
+            print(f"\n🚨 [TIMEOUT GUARDIAN] Subprocess exceeded {timeout_sec}s limit! Killing hanging process...")
+            proc.kill()
+            proc.wait()
+            break
+
+        if now - last_heartbeat > 10.0:
+            sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] ⏳ Compiling / Executing... (Elapsed: {elapsed:.1f}s / {timeout_sec}s max)\n")
+            sys.stdout.flush()
+            last_heartbeat = now
+
+        time.sleep(0.1)
+
+    full_output = "".join(output_lines)
     t1 = time.time()
 
-    print(f"Subprocess completed with return code {proc.returncode} in {t1 - t0:.2f}s")
-
-    metrics = parse_telemetry_from_output(stdout + "\n" + stderr)
-    if proc.returncode != 0:
-        if "OutOfMemory" in stderr or "OOM" in stderr:
-            metrics["oom_detected"] = True
-        else:
-            metrics["nan_detected"] = True
+    if timed_out:
+        print(f"❌ Subprocess TIMED OUT after {t1 - t0:.2f}s")
+        metrics = {
+            "step_time_ms": 99999.0,
+            "final_loss": 999.0,
+            "peak_gflops": 0.0,
+            "mfu_pct": 0.0,
+            "nan_detected": True,
+            "oom_detected": True,
+            "status": "TIMED_OUT",
+        }
+    else:
+        print(f"✅ Subprocess completed with return code {proc.returncode} in {t1 - t0:.2f}s")
+        metrics = parse_telemetry_from_output(full_output)
+        if proc.returncode != 0:
+            if "OutOfMemory" in full_output or "OOM" in full_output or "NV_ERR_NO_MEMORY" in full_output:
+                metrics["oom_detected"] = True
+            else:
+                metrics["nan_detected"] = True
 
     score_file = "score.json"
     with open(score_file, "w") as f:

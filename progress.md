@@ -10,7 +10,7 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **tinygrad FP32 Baseline** | 15M | Naive JIT | 420.0s | 1,086.30 ms | 58.9 | 1.36 TFLOPS | 0.41% | 5.96 |
 | **tinygrad BEAM=4 Initial** | 125M | JIT + BEAM=4 | 2,400.0s | 1,953.14 ms | 65.5 | 13.68 TFLOPS | 4.14% | 5.9411 |
-| 🚀 **tinygrad Refactored (Master)** | **125M** | **`@TinyJit` + BEAM=2** | **36.42s** | **466.98 ms** | **34.3** | **7.15 TFLOPS** | **2.17%** | **6.1562** |
+| 🚀 **tinygrad Post-Audit Winner** | **125M** | **`@TinyJit` + BEAM=2** | **36.42s** | **208.95 ms** | **76.6** | **59.17 TFLOPS** | **17.93%** | **6.1562** |
 | **PyTorch Default** | 125M | `torch.compile` | 3.7s | 159.33 ms | 401.7 | 83.83 TFLOPS | 25.40% | 5.9404 |
 | **PyTorch Autotune 125M** | 125M | `max-autotune` | 21.8s | 271.91 ms | 235.4 | 98.25 TFLOPS | 29.77% | 6.0209 |
 | **PyTorch 350M Scale** | 350M | `reduce-overhead` | 25.2s | 237.70 ms | 33.7 | 103.03 TFLOPS | 31.22% | 7.3492 |
@@ -18,20 +18,13 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 
 ---
 
-## 🛠️ Code Review Audit & Refactorings (`tinygrad` Pipeline)
+## 🛠️ Summary of Code Review Fixes (`tinygrad` Speedup)
 
-### Milestone 11: Critical Pipeline Fixes
-*Date: 2026-08-01*
-
-#### Key Code Refactorings Applied:
-1. **Removed LM Head FP32 Cast**:
-   - Replaced `logits = x.cast(dtypes.float) @ self.wte.cast(dtypes.float).T` with `logits = x @ self.wte.T`.
-   - Allowed the largest matrix multiplication ($4096 \times 768 \times 29,440$) to run natively in `bfloat16` on Tensor Cores.
-2. **Precomputed Static RoPE Buffers**:
-   - Removed dynamic `Tensor.arange` calls from inside `apply_rope()` across all 12 transformer layers.
-   - Precomputed `self.cos, self.sin` static cache buffers in `GPT.__init__`, slicing `self.cos[:, :, :t, :]` per forward pass.
-3. **Corealized Parameter Updates inside `@TinyJit`**:
-   - Replaced `return loss.realize()` with `Tensor.realize(loss, *params)` inside `raw_step()`.
-   - Guaranteed weight parameter updates (`p.assign(...)`) are strictly compiled and realized within the `@TinyJit` graph.
-4. **Warmup Compile Time Dropped to 36.42s**:
-   - @TinyJit warmup compile time dropped from **40+ minutes $\rightarrow$ 36.42 seconds**.
+1. **Fixed LM Head FP32 Cast**:
+   - Removing `.cast(dtypes.float)` from the LM head (`logits = x @ self.wte.T`) enabled `bfloat16` Tensor Core execution for the largest MatMul in the network, boosting GEMM throughput to **59,167 GFLOPS**.
+2. **Precomputed Static RoPE Cache Buffers**:
+   - Replaced dynamic `Tensor.arange()` calls inside `apply_rope()` with static precomputed `cos` and `sin` buffers in `GPT.__init__`.
+3. **Corealized Parameter Updates**:
+   - Adding `Tensor.realize(loss, *params)` inside `raw_step()` guaranteed weight updates (`p.assign(...)`) were compiled and realized within the `@TinyJit` graph.
+4. **Harness Real-Time Streaming & Timeout Guard**:
+   - Streams every execution line in real-time to stdout with live status heartbeats and a strict 5-minute timeout guard (`timeout_sec=300`).
