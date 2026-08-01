@@ -18,7 +18,7 @@ def apply_rope(x: Tensor) -> Tensor:
     b, h, t, d = x.shape
     inv_freq = 1.0 / (10000.0 ** (Tensor.arange(0, d, 2, dtype=dtypes.float) / d))
     t_pos = Tensor.arange(0, t, dtype=dtypes.float)
-    freqs = t_pos.reshape(t, 1) @ inv_freq.reshape(1, d // 2)
+    freqs = t_pos.reshape(t, 1) * inv_freq.reshape(1, d // 2)
     emb = Tensor.cat(freqs, freqs, dim=-1).reshape(1, 1, t, d)
     cos, sin = emb.cos().cast(x.dtype), emb.sin().cast(x.dtype)
     x1 = x[:, :, :, : d // 2]

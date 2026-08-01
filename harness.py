@@ -240,7 +240,7 @@ def run_transient_suite(base_config: dict) -> dict:
 
         print(f"[BEAM RESULT] BEAM={beam_val}: Step Time={step_ms:.2f}ms | GFLOPS={gflops:.1f} | MFU={mfu:.2f}%")
 
-        if step_ms < best_step_time or beam_val == 0:
+        if not m.get("nan_detected") and not m.get("oom_detected") and (step_ms < best_step_time or beam_val == 0):
             best_step_time = step_ms
             best_beam = beam_val
 
