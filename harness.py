@@ -135,9 +135,31 @@ def run_harness(config_path: str = "config.json") -> dict:
         stderr=subprocess.PIPE,
         env=env,
         text=True,
+        bufsize=1,
     )
 
-    stdout, stderr = proc.communicate()
+    stdout_lines = []
+    stderr_lines = []
+
+    # Stream real-time progress lines to stdout
+    while True:
+        line = proc.stderr.readline()
+        if not line and proc.poll() is not None:
+            break
+        if line:
+            stderr_lines.append(line)
+            if "[STEP" in line or "[train.py]" in line:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+    out_rest, err_rest = proc.communicate()
+    if out_rest:
+        stdout_lines.append(out_rest)
+    if err_rest:
+        stderr_lines.append(err_rest)
+
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
     t1 = time.time()
 
     print(f"Subprocess completed with return code {proc.returncode} in {t1 - t0:.2f}s")
@@ -230,6 +252,7 @@ def run_transient_suite(base_config: dict) -> dict:
     for beam_val in [0, 2, 4]:
         print(f"\n[BEAM SWEEP] Evaluating BEAM={beam_val}...")
         current_config["BEAM"] = beam_val
+        current_config["NUM_STEPS"] = 3
         with open("config.json", "w") as f:
             json.dump(current_config, f, indent=2)
 

@@ -176,8 +176,11 @@ def main():
             sys.stderr.write(f"[train.py] NaN/Inf detected at step {step}!\n")
             break
 
-        if step == 1 or step == num_steps or step % 5 == 0:
-            sys.stderr.write(f"[STEP {step:03d}] loss={loss_val:.4f} | step_time={step_ms:.2f}ms\n")
+        current_gflops = (flops_per_step / (step_ms / 1000.0)) / 1e9 if step_ms > 0 else 0.0
+        current_mfu = round((current_gflops / 330000.0) * 100.0, 2)
+        sys.stderr.write(
+            f"  └─ [STEP {step:02d}/{num_steps}] loss={loss_val:.4f} | step_time={step_ms:.2f}ms | GFLOPS={current_gflops:.1f} | MFU={current_mfu:.2f}%\n"
+        )
 
     avg_step_ms = float(np.mean(step_times)) if step_times else 9999.0
     final_loss = losses[-1] if losses else float("nan")
