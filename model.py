@@ -52,9 +52,9 @@ class CausalSelfAttention:
         b, t, c = x.shape
         qkv = x @ self.c_attn
         q, k, v = qkv.chunk(3, dim=-1)
-        q = q.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2)
+        q = q.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        k = k.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        v = v.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
 
         if self.use_rope:
             q = apply_rope(q)
