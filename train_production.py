@@ -132,7 +132,8 @@ def main():
         scaled_loss = loss * loss_scale
         scaled_loss.backward()
         optimizer.step()
-        return loss.realize()
+        Tensor.realize(loss, *params)
+        return loss
 
     if use_jit:
         step_fn = TinyJit(raw_step)
@@ -174,7 +175,7 @@ def main():
         step_times.append(step_ms)
 
         if step == 1 or step == args.total_steps or step % 10 == 0:
-            loss_val = float(loss_tensor.item())
+            loss_val = float(loss_tensor.cast(dtypes.float).item())
             throughput = (batch_size / (step_ms / 1000.0)) if step_ms > 0 else 0.0
             gflops = (flops_per_step / (step_ms / 1000.0)) / 1e9 if step_ms > 0 else 0.0
             mfu_pct = (gflops / 330000.0) * 100.0
@@ -187,8 +188,9 @@ def main():
         # Checkpointing & Validation Eval
         if step % args.eval_interval == 0 or step == args.total_steps:
             x_v, y_v = get_batch(valid_data, step + 999)
-            val_loss_tensor = step_fn(x_v, y_v)
-            val_loss = float(val_loss_tensor.item())
+            val_logits = model.forward(x_v)
+            val_loss_tensor = val_logits.sparse_categorical_crossentropy(y_v).realize()
+            val_loss = float(val_loss_tensor.cast(dtypes.float).item())
             print(f"📊 Validation Loss at step {step}: {val_loss:.4f}")
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")

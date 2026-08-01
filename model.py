@@ -13,18 +13,23 @@ def pad_vocab_size(vocab_size: int, multiple: int = 128) -> int:
     return ((vocab_size + multiple - 1) // multiple) * multiple
 
 
-def apply_rope(x: Tensor) -> Tensor:
-    """Apply Rotary Position Embeddings (RoPE) to Query or Key tensor."""
+def precompute_freqs_cis(dim: int, max_len: int = 2048) -> tuple[Tensor, Tensor]:
+    """Precompute static RoPE cos and sin buffers up to max_len."""
+    inv_freq = 1.0 / (10000.0 ** (Tensor.arange(0, dim, 2, dtype=dtypes.float) / dim))
+    t_pos = Tensor.arange(0, max_len, dtype=dtypes.float)
+    freqs = t_pos.reshape(max_len, 1) * inv_freq.reshape(1, dim // 2)
+    emb = Tensor.cat(freqs, freqs, dim=-1).reshape(1, 1, max_len, dim)
+    return emb.cos().realize(), emb.sin().realize()
+
+
+def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Apply precomputed Rotary Position Embeddings (RoPE) to Query or Key tensor."""
     b, h, t, d = x.shape
-    inv_freq = 1.0 / (10000.0 ** (Tensor.arange(0, d, 2, dtype=dtypes.float) / d))
-    t_pos = Tensor.arange(0, t, dtype=dtypes.float)
-    freqs = t_pos.reshape(t, 1) * inv_freq.reshape(1, d // 2)
-    emb = Tensor.cat(freqs, freqs, dim=-1).reshape(1, 1, t, d)
-    cos, sin = emb.cos().cast(x.dtype), emb.sin().cast(x.dtype)
+    c, s = cos[:, :, :t, :].cast(x.dtype), sin[:, :, :t, :].cast(x.dtype)
     x1 = x[:, :, :, : d // 2]
     x2 = x[:, :, :, d // 2 :]
     x_rot = Tensor.cat(-x2, x1, dim=-1)
-    return x * cos + x_rot * sin
+    return x * c + x_rot * s
 
 
 class RMSNorm:
@@ -39,7 +44,7 @@ class RMSNorm:
 
 
 class CausalSelfAttention:
-    """Fused Scaled Dot-Product Causal Self-Attention with Optional RoPE."""
+    """Fused Scaled Dot-Product Causal Self-Attention with Static RoPE Buffers."""
 
     def __init__(self, d_model: int, n_heads: int, use_rope: bool = True):
         self.n_heads = n_heads
@@ -48,7 +53,7 @@ class CausalSelfAttention:
         self.c_attn = Tensor.glorot_uniform(d_model, 3 * d_model)
         self.c_proj = Tensor.glorot_uniform(d_model, d_model)
 
-    def __call__(self, x: Tensor) -> Tensor:
+    def __call__(self, x: Tensor, cos: Tensor = None, sin: Tensor = None) -> Tensor:
         b, t, c = x.shape
         qkv = x @ self.c_attn
         q, k, v = qkv.chunk(3, dim=-1)
@@ -56,9 +61,9 @@ class CausalSelfAttention:
         k = k.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        if self.use_rope:
-            q = apply_rope(q)
-            k = apply_rope(k)
+        if self.use_rope and cos is not None and sin is not None:
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
 
         # Fused Scaled Dot-Product Attention (SDPA / FlashAttention)
         y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -99,8 +104,8 @@ class Block:
         self.rms_2 = RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, d_ff) if use_swiglu else GELUMLP(d_model, d_ff)
 
-    def __call__(self, x: Tensor) -> Tensor:
-        x = x + self.attn(self.rms_1(x))
+    def __call__(self, x: Tensor, cos: Tensor = None, sin: Tensor = None) -> Tensor:
+        x = x + self.attn(self.rms_1(x), cos=cos, sin=sin)
         x = x + self.mlp(self.rms_2(x))
         return x
 
@@ -123,11 +128,15 @@ class GPT:
         self.raw_vocab_size = vocab_size
         self.vocab_size = pad_vocab_size(vocab_size, pad_vocab_multiple)
         self.d_model = d_model
+        self.n_heads = n_heads
         self.use_rope = use_rope
 
         self.wte = Tensor.glorot_uniform(self.vocab_size, d_model)
-        if not use_rope:
+        if use_rope:
+            self.cos, self.sin = precompute_freqs_cis(d_model // n_heads, max_len=max_len)
+        else:
             self.wpe = Tensor.glorot_uniform(max_len, d_model)
+            self.cos, self.sin = None, None
 
         self.h = [Block(d_model, n_heads, d_ff, use_swiglu=use_swiglu, use_rope=use_rope) for _ in range(n_layers)]
         self.rms_f = RMSNorm(d_model)
@@ -140,10 +149,10 @@ class GPT:
             x = x + self.wpe[pos]
 
         for block in self.h:
-            x = block(x)
+            x = block(x, cos=self.cos, sin=self.sin)
 
         x = self.rms_f(x)
-        logits = x.cast(dtypes.float) @ self.wte.cast(dtypes.float).T
+        logits = x @ self.wte.T
         return logits
 
     def num_params(self) -> int:
