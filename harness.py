@@ -194,6 +194,8 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
         config = copy.deepcopy(base_config)
         config["MICRO_BATCH_SIZE"] = test_batch
         config["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // test_batch)
+        config["BEAM"] = 0
+        config["NUM_STEPS"] = 3
 
         with open("config.json", "w") as f:
             json.dump(config, f, indent=2)

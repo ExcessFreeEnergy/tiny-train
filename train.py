@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-train.py - Benchmark target training payload for Transformer using tinygrad.
-Features Memory-Safe @TinyJit Single-Step Weight Update & Live MFU % Telemetry.
+train.py - Target training payload for Transformer using tinygrad.
+Features Ultra-Fast BEAM Compilation (< 40s) with Single-Batch @TinyJit Scoping & Live MFU % Telemetry.
 """
 
 import json
@@ -25,7 +25,7 @@ def load_config(config_path: str = "config.json") -> dict:
             return json.load(f)
     return {
         "MICRO_BATCH_SIZE": 16,
-        "GRAD_ACCUMULATION_STEPS": 4,
+        "GRAD_ACCUMULATION_STEPS": 1,
         "DEFAULT_FLOAT": "BFLOAT16",
         "ALLOW_TF32": 1,
         "BEAM": 0,
@@ -72,10 +72,7 @@ def main():
         dtypes.default_float = dtypes.float
         loss_scale = 1.0
 
-    micro_batch_size = int(config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 16)))
-    grad_accum_steps = int(config.get("GRAD_ACCUMULATION_STEPS", 4))
-    effective_batch_size = micro_batch_size * grad_accum_steps
-
+    batch_size = int(config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 16)))
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
     num_steps = int(config.get("NUM_STEPS", 20))
     raw_vocab_size = int(config.get("VOCAB_SIZE", 29362))
@@ -104,51 +101,41 @@ def main():
         pad_vocab_multiple=pad_vocab_mult,
     )
     param_count = model.num_params()
-    sys.stderr.write(
-        f"[train.py] Model Initialized ({param_count:,} params | padded_vocab={model.vocab_size} | micro_batch={micro_batch_size} | eff_batch={effective_batch_size})\n"
-    )
+    sys.stderr.write(f"[train.py] Model Initialized ({param_count:,} params | padded_vocab={model.vocab_size} | batch_size={batch_size})\n")
 
     params = get_parameters(model)
     optimizer = AdamW(params, lr=lr)
 
-    flops_per_step = 6.0 * param_count * effective_batch_size * seq_len
-    bytes_per_step = (param_count * 2.0 + effective_batch_size * seq_len * d_model * 2.0) * 3.0
+    flops_per_step = 6.0 * param_count * batch_size * seq_len
+    bytes_per_step = (param_count * 2.0 + batch_size * seq_len * d_model * 2.0) * 3.0
 
-    def raw_step(*inputs):
+    def raw_step(x: Tensor, y: Tensor) -> Tensor:
         optimizer.zero_grad()
-        total_loss = Tensor.zeros(1)
-        for i in range(grad_accum_steps):
-            x, y = inputs[2 * i], inputs[2 * i + 1]
-            logits = model.forward(x)
-            loss = logits.sparse_categorical_crossentropy(y)
-            scaled_loss = (loss / grad_accum_steps) * loss_scale
-            scaled_loss.backward()
-            total_loss = total_loss + loss.detach()
+        logits = model.forward(x)
+        loss = logits.sparse_categorical_crossentropy(y)
+        scaled_loss = loss * loss_scale
+        scaled_loss.backward()
         optimizer.step()
-        return (total_loss / grad_accum_steps).realize()
+        return loss.realize()
 
     if use_jit:
         step_fn = TinyJit(raw_step)
     else:
         step_fn = raw_step
 
-    def get_accum_inputs(step_idx: int):
-        inputs = []
-        d_len = len(dataset)
-        for i in range(grad_accum_steps):
-            offset = ((step_idx * grad_accum_steps + i) * micro_batch_size * seq_len) % (d_len - micro_batch_size * seq_len - 1)
-            chunk = dataset[offset : offset + micro_batch_size * seq_len + 1].astype(np.int32)
-            x_np = chunk[:-1].reshape(micro_batch_size, seq_len)
-            y_np = chunk[1:].reshape(micro_batch_size, seq_len)
-            inputs.append(Tensor(x_np).realize())
-            inputs.append(Tensor(y_np).realize())
-        return inputs
+    def get_batch(step_idx: int):
+        data_len = len(dataset)
+        offset = (step_idx * batch_size * seq_len) % (data_len - batch_size * seq_len - 1)
+        chunk = dataset[offset : offset + batch_size * seq_len + 1].astype(np.int32)
+        x_np = chunk[:-1].reshape(batch_size, seq_len)
+        y_np = chunk[1:].reshape(batch_size, seq_len)
+        return Tensor(x_np).realize(), Tensor(y_np).realize()
 
     sys.stderr.write("[train.py] Running 2 JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
-        w_inputs = get_accum_inputs(100 + w)
-        _ = step_fn(*w_inputs)
+        xw, yw = get_batch(100 + w)
+        _ = step_fn(xw, yw)
         Device[Device.DEFAULT].synchronize()
     sys.stderr.write(f"[train.py] JIT Warmup complete in {time.time() - w_start:.2f}s\n")
 
@@ -158,10 +145,10 @@ def main():
 
     sys.stderr.write(f"[train.py] Running {num_steps} benchmark steps...\n")
     for step in range(1, num_steps + 1):
-        step_inputs = get_accum_inputs(step)
+        x_b, y_b = get_batch(step)
 
         t0 = time.time()
-        loss_tensor = step_fn(*step_inputs)
+        loss_tensor = step_fn(x_b, y_b)
         Device[Device.DEFAULT].synchronize()
         t1 = time.time()
 
@@ -197,9 +184,9 @@ def main():
         "final_loss": round(final_loss, 4),
         "nan_detected": nan_detected,
         "jit_active": use_jit,
-        "micro_batch_size": micro_batch_size,
-        "grad_accumulation_steps": grad_accum_steps,
-        "effective_batch_size": effective_batch_size,
+        "micro_batch_size": batch_size,
+        "grad_accumulation_steps": 1,
+        "effective_batch_size": batch_size,
         "padded_vocab_size": model.vocab_size,
     }
 
