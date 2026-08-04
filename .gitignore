@@ -24,3 +24,14 @@ gigatoken/gigatoken/*.dll
 gigatoken/gigatoken/__pycache__/
 gigatoken/dist/
 gigatoken/wheels/
+
+# Checkpoints & Model weights
+checkpoints/
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# Logs & execution traces
+*.log
+

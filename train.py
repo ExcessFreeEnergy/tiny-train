@@ -7,6 +7,11 @@ Features Ultra-Fast BEAM Compilation (< 40s) with Single-Batch @TinyJit Scoping 
 import json
 import math
 import os
+
+os.environ["ALLOW_TF32"] = os.environ.get("ALLOW_TF32", "1")
+os.environ["TINYCACHE"] = os.environ.get("TINYCACHE", "1")
+os.environ["HCQ"] = os.environ.get("HCQ", "1")
+
 import sys
 import time
 
@@ -24,8 +29,8 @@ def load_config(config_path: str = "config.json") -> dict:
         with open(config_path) as f:
             return json.load(f)
     return {
-        "MICRO_BATCH_SIZE": 16,
-        "GRAD_ACCUMULATION_STEPS": 1,
+        "MICRO_BATCH_SIZE": 64,
+        "GRAD_ACCUMULATION_STEPS": 4,
         "DEFAULT_FLOAT": "BFLOAT16",
         "ALLOW_TF32": 1,
         "BEAM": 0,
@@ -72,7 +77,7 @@ def main():
         dtypes.default_float = dtypes.float
         loss_scale = 1.0
 
-    batch_size = int(config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 16)))
+    batch_size = int(config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 64)))
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
     num_steps = int(config.get("NUM_STEPS", 20))
     raw_vocab_size = int(config.get("VOCAB_SIZE", 29362))
@@ -109,20 +114,6 @@ def main():
     flops_per_step = 6.0 * param_count * batch_size * seq_len
     bytes_per_step = (param_count * 2.0 + batch_size * seq_len * d_model * 2.0) * 3.0
 
-    def raw_step(x: Tensor, y: Tensor) -> Tensor:
-        optimizer.zero_grad()
-        logits = model.forward(x)
-        loss = logits.sparse_categorical_crossentropy(y)
-        scaled_loss = loss * loss_scale
-        scaled_loss.backward()
-        optimizer.step()
-        return loss.realize()
-
-    if use_jit:
-        step_fn = TinyJit(raw_step)
-    else:
-        step_fn = raw_step
-
     def get_batch(step_idx: int):
         data_len = len(dataset)
         offset = (step_idx * batch_size * seq_len) % (data_len - batch_size * seq_len - 1)
@@ -131,6 +122,30 @@ def main():
         y_np = chunk[1:].reshape(batch_size, seq_len)
         return Tensor(x_np).realize(), Tensor(y_np).realize()
 
+    def raw_step(x: Tensor, y: Tensor) -> Tensor:
+        optimizer.zero_grad()
+        logits = model.forward(x)
+        loss = logits.sparse_categorical_crossentropy(y)
+        scaled_loss = loss * loss_scale
+        scaled_loss.backward()
+        Tensor.realize(loss, *optimizer.schedule_step())
+        return loss
+
+    # 1. Fetch a single initialization batch
+    init_x, init_y = get_batch(0)
+
+    # 2. Run ONE uncompiled step to force AdamW to allocate momentum buffers
+    sys.stderr.write("[train.py] Initializing optimizer states before JIT...\n")
+    raw_step(init_x, init_y)
+    Device[Device.DEFAULT].synchronize()
+
+    # 3. NOW it is safe to lock the graph and wrap in TinyJit
+    if use_jit:
+        step_fn = TinyJit(raw_step)
+    else:
+        step_fn = raw_step
+
+    # 4. Proceed with JIT warmup to trigger the actual kernel compilation
     sys.stderr.write("[train.py] Running 2 JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
@@ -155,7 +170,7 @@ def main():
         step_ms = (t1 - t0) * 1000.0
         step_times.append(step_ms)
 
-        loss_val = float(loss_tensor.item())
+        loss_val = float(loss_tensor.cast(dtypes.float).item())
         losses.append(loss_val)
 
         if math.isnan(loss_val) or math.isinf(loss_val):
@@ -169,7 +184,7 @@ def main():
             f"  └─ [STEP {step:02d}/{num_steps}] loss={loss_val:.4f} | step_time={step_ms:.2f}ms | GFLOPS={current_gflops:.1f} | MFU={current_mfu:.2f}%\n"
         )
 
-    avg_step_ms = float(np.mean(step_times)) if step_times else 9999.0
+    avg_step_ms = float(np.mean(step_times[1:])) if len(step_times) > 1 else (float(np.mean(step_times)) if step_times else 9999.0)
     final_loss = losses[-1] if losses else float("nan")
 
     peak_gflops = (flops_per_step / (avg_step_ms / 1000.0)) / 1e9 if avg_step_ms > 0 else 0.0

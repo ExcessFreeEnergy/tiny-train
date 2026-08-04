@@ -19,13 +19,13 @@ def precompute_freqs_cis(dim: int, max_len: int = 2048) -> tuple[Tensor, Tensor]
     t_pos = Tensor.arange(0, max_len, dtype=dtypes.float)
     freqs = t_pos.reshape(max_len, 1) * inv_freq.reshape(1, dim // 2)
     emb = Tensor.cat(freqs, freqs, dim=-1).reshape(1, 1, max_len, dim)
-    return emb.cos().realize(), emb.sin().realize()
+    return emb.cos().cast(dtypes.default_float).realize(), emb.sin().cast(dtypes.default_float).realize()
 
 
 def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     """Apply precomputed Rotary Position Embeddings (RoPE) to Query or Key tensor."""
     b, h, t, d = x.shape
-    c, s = cos[:, :, :t, :].cast(x.dtype), sin[:, :, :t, :].cast(x.dtype)
+    c, s = cos[:, :, :t, :], sin[:, :, :t, :]
     x1 = x[:, :, :, : d // 2]
     x2 = x[:, :, :, d // 2 :]
     x_rot = Tensor.cat(-x2, x1, dim=-1)
