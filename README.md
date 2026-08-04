@@ -109,6 +109,12 @@ To keep fixed micro-batch size (`MICRO_BATCH_SIZE=64`, `GRAD_ACCUMULATION_STEPS=
 BEAM_DEV_TIMEOUT=5 uv run python src/harness.py --run-suite --skip-batch-sweep
 ```
 
+#### Run Full Suite with Disk Cache \u0026 No BEAM Timeout (Recommended for Production Runs):
+Enables `TINYCACHE=1` for instant disk-cached kernel re-runs, skips the batch sweep (uses locked config), and removes the BEAM compiler timeout. Pipe output to a numbered log file for audit:
+```bash
+TINYCACHE=1 uv run python src/harness.py --run-suite --skip-batch-sweep --no-beam-timeout | tee run{training_iteration}.log
+```
+
 #### Run Micro-Batch Sweep Only:
 ```bash
 python src/harness.py --sweep-batch

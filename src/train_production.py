@@ -19,7 +19,7 @@ import sys
 import time
 
 # Add this immediately to prevent TinyJit AST traversal from crashing
-sys.setrecursionlimit(10000)
+sys.setrecursionlimit(50000)
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -137,6 +137,12 @@ def main():
     print("=======================================================\n")
 
     params = get_parameters(model)
+
+    # SEVER RNG GRAPH: Force all glorot_uniform weights into VRAM
+    # so the optimizer never sees the RNG initialization history.
+    sys.stderr.write("[train_production.py] Realizing model weights into VRAM...\n")
+    Tensor.realize(*params)
+
     optimizer = AdamW(params, lr=max_lr)
 
     flops_per_step = 6.0 * param_count * batch_size * seq_len
@@ -156,6 +162,13 @@ def main():
         loss = logits.sparse_categorical_crossentropy(y)
         scaled_loss = loss * loss_scale
         scaled_loss.backward()
+
+        # SEVER BACKWARD/OPTIMIZER GRAPH: Realize gradients into VRAM
+        # so AdamW operates on a fresh, shallow graph.
+        grads = [p.grad for p in params if p.grad is not None]
+        Tensor.realize(*grads)
+
+        # Now schedule weight updates on a shallow, independent graph
         Tensor.realize(loss, *optimizer.schedule_step())
         return loss
 
