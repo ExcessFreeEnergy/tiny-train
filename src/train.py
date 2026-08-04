@@ -4,6 +4,8 @@ train.py - Target training payload for Transformer using tinygrad.
 Features Ultra-Fast BEAM Compilation (< 40s) with Single-Batch @TinyJit Scoping & Live MFU % Telemetry.
 """
 
+# ruff: noqa: E402
+
 import json
 import math
 import os
@@ -15,6 +17,9 @@ os.environ["HCQ"] = os.environ.get("HCQ", "1")
 import sys
 import time
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 import numpy as np
 from tinygrad import Tensor, TinyJit, dtypes
 from tinygrad.device import Device
@@ -24,7 +29,12 @@ from tinygrad.nn.state import get_parameters
 from model import GPT
 
 
-def load_config(config_path: str = "config.json") -> dict:
+def load_config(config_path: str = "conf/config.json") -> dict:
+    if not os.path.exists(config_path):
+        for alt_path in ["config.json", "conf/best_config.json", "best_config.json"]:
+            if os.path.exists(alt_path):
+                config_path = alt_path
+                break
     if os.path.exists(config_path):
         with open(config_path) as f:
             return json.load(f)

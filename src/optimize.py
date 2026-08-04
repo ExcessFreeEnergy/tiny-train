@@ -8,11 +8,17 @@ Executes the 3-Phase Suite Sequence:
   - Phase 3: SwiGLU Activation Fusion (USE_SWIGLU=1 for maximum arithmetic intensity)
 """
 
+# ruff: noqa: E402
+
 import argparse
 import copy
 import json
 import os
+import sys
 from typing import Any
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from harness import find_optimal_batch_size, run_harness
 
@@ -176,8 +182,8 @@ def main():
     parser.add_argument("--skip-sweep", action="store_true", default=False, help="Skip Phase 1 micro-batch discovery sweep")
     args = parser.parse_args()
 
-    config_path = "config.json"
-    best_config_path = "best_config.json"
+    config_path = "conf/config.json"
+    best_config_path = "conf/best_config.json"
 
     # Baseline configuration
     active_config = load_json(

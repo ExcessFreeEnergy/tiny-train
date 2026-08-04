@@ -19,11 +19,11 @@ Your primary objective is to **target ~35% MFU (~115 TFLOPS)** on the target mod
 │    ├── SwiGLU / GELU Fusion Test (Check for kernel growth)  │
 │    └── BEAM Compiler Search (Lock layout for fixed shape)   │
 └──────────────────────────────┬──────────────────────────────┘
-                               │ Writes optimized best_config.json
+                               │ Writes optimized conf/best_config.json
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 2. MAIN PRODUCTION TRAINER (Stage 2: train_production.py)  │
-│    ├── Loads best_config.json (Zero compiler overhead)      │
+│ 2. MAIN PRODUCTION TRAINER (Stage 2: src/train_production.py)│
+│    ├── Loads conf/best_config.json (Zero compiler overhead) │
 │    ├── Streams dataset via np.memmap (TinyStories)          │
 │    ├── Cosine LR Decay + Warmup + Safe Checkpointing        │
 │    └── Achieves high MFU immediately on Step 1              │
@@ -41,7 +41,7 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 - Halves VRAM transfer byte volume and lowers the compute-bound threshold, unlocking Ada Lovelace Tensor Cores.
 
 ### Phase 2: Micro-Batch Saturation (OOM-Safe Sweep)
-- Keep `BEAM=0`. Run the OOM-safe micro-batch sweep in `harness.py` (`python harness.py --sweep-batch`).
+- Keep `BEAM=0`. Run the OOM-safe micro-batch sweep in `src/harness.py` (`python src/harness.py --sweep-batch`).
 - Doubly sweep `MICRO_BATCH_SIZE` (16 $\rightarrow$ 32 $\rightarrow$ 64 $\rightarrow$ 128 $\rightarrow$ 256...) while setting `GRAD_ACCUMULATION_STEPS = max(1, 256 // MICRO_BATCH_SIZE)` to keep effective batch size constant.
 - Stop when throughput (`samples/sec`) gain is < 5% or OOM occurs. Lock in this winning micro-batch size.
 
@@ -49,7 +49,7 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 - With tensor shapes locked in, set `BEAM=2` (or `BEAM=4`). Ensure tight `@TinyJit` micro-batch scoping and `TINYCACHE=1` are enabled. Initial search completes in ~2 minutes, and subsequent re-runs load from `~/.cache/tinygrad/cache.db` in <2 seconds.
 
 ### Phase 4: SwiGLU Activation Fusion
-- Test SwiGLU MLP blocks (`USE_SWIGLU=1` in `config.json` or `SwiGLUMLP` in `model.py`) to increase arithmetic intensity (`(x @ w1).silu() * (x @ w3) @ w2`).
+- Test SwiGLU MLP blocks (`USE_SWIGLU=1` in `conf/config.json` or `SwiGLUMLP` in `src/model.py`) to increase arithmetic intensity (`(x @ w1).silu() * (x @ w3) @ w2`).
 
 ---
 
@@ -64,7 +64,7 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 
 ### C. Zero Intermediate Flushes & Tight @TinyJit Scoping
 - **Rule 4:** NEVER call `.realize()`, `.item()`, or `.numpy()` inside `model.forward()`.
-- **Rule 5:** Defer `.item()` loss evaluation in `train.py` ONLY to designated logging steps.
+- **Rule 5:** Defer `.item()` loss evaluation in `src/train.py` ONLY to designated logging steps.
 - **Rule 6:** ALWAYS scope `@TinyJit` cleanly and enable `TINYCACHE=1` for instant disk-cached re-runs.
 
 ### D. Code Quality & Linter Compliance
@@ -88,9 +88,9 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 
 ```bash
 #- **2-Stage Architecture**:
-  1. **Stage 1 (Harness Suite)**: `python harness.py --run-suite` executes the transient 3-phase optimization suite:
+  1. **Stage 1 (Harness Suite)**: `python src/harness.py --run-suite` executes the transient 3-phase optimization suite:
      - **Phase 1 (Batch Optimization)**: OOM-Safe Micro-Batch Sweep discovering optimal hardware saturation.
      - **Phase 2 (BEAM Compiler Search)**: Iteratively tests `BEAM=0` $\rightarrow$ `BEAM=2` $\rightarrow$ `BEAM=4` $\rightarrow$ `BEAM=8`, saving compiled CUDA/PTX binaries to `~/.cache/tinygrad/cache.db` (`TINYCACHE=1`).
      - **Phase 3 (SwiGLU Activation Fusion)**: Tests SwiGLU gated activation fusion (`USE_SWIGLU=1`) for maximum arithmetic intensity.
-  2. **Stage 2 (Main Production Trainer)**: `python train_production.py --model-size 125M` loads `best_config.json`, streaming dataset tokens via `np.memmap`, applying Cosine LR schedule with Warmup, evaluating validation loss, and saving `.safetensors` checkpoints.
+  2. **Stage 2 (Main Production Trainer)**: `python src/train_production.py --model-size 125M` loads `conf/best_config.json`, streaming dataset tokens via `np.memmap`, applying Cosine LR schedule with Warmup, evaluating validation loss, and saving `.safetensors` checkpoints.
 ```

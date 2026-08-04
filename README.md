@@ -30,20 +30,47 @@ High-performance, hardware-optimized Transformer model training engine built on 
 
 ```text
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. HARNESS SUITE (Stage 1: harness.py)                      │
+│ 1. HARNESS SUITE (Stage 1: src/harness.py)                  │
 │    ├── Phase 1: Micro-Batch OOM-Safe Sweep                  │
 │    ├── Phase 2: BEAM Compiler Search (BEAM=0 -> 2 -> 4)     │
 │    └── Phase 3: SwiGLU Activation Fusion                    │
 └──────────────────────────────┬──────────────────────────────┘
-                               │ Writes best_config.json
+                               │ Writes conf/best_config.json
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ 2. MAIN PRODUCTION TRAINER (Stage 2: train_production.py)  │
-│    ├── Loads best_config.json                               │
+│ 2. MAIN PRODUCTION TRAINER (Stage 2: src/train_production.py)│
+│    ├── Loads conf/best_config.json                          │
 │    ├── Streams dataset via np.memmap                        │
 │    ├── Cosine LR Decay + Warmup Schedule                    │
 │    └── Safetensors Checkpointing & Validation Loss Evaluation │
 └─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Project Structure
+
+```text
+tiny_train/
+├── conf/                     # Configuration files & telemetry output
+│   ├── config.json
+│   ├── best_config.json
+│   └── score.json
+├── src/                      # Source code modules
+│   ├── __init__.py
+│   ├── model.py              # Transformer model architecture
+│   ├── train.py              # Standalone benchmark trainer
+│   ├── train_production.py   # Production training engine
+│   ├── harness.py            # Optimization suite & execution wrapper
+│   ├── optimize.py           # Automated transient optimization loop with TUI
+│   ├── retokenize.py         # Dataset tokenization script
+│   └── main.py               # Entrypoint script
+├── checkpoints/              # Checkpoint output directory
+├── data/                     # Training datasets
+├── lint.sh                   # Linter & formatter verification script
+├── pyproject.toml            # Project dependencies & tool configuration
+├── README.md                 # Project documentation
+└── AGENT.md                  # Development guidelines
 ```
 
 ---
@@ -61,52 +88,52 @@ uv sync
 ./lint.sh
 ```
 
-### 2. Standalone Benchmark Test (`train.py`)
+### 2. Standalone Benchmark Test (`src/train.py`)
 
-Run `train.py` to quickly benchmark step time, GFLOPS, and MFU % over benchmark steps:
+Run `src/train.py` to quickly benchmark step time, GFLOPS, and MFU % over benchmark steps:
 ```bash
-python train.py
+python src/train.py
 ```
 
-### 3. Stage 1: Harness Optimization Suite (`harness.py`)
+### 3. Stage 1: Harness Optimization Suite (`src/harness.py`)
 
 #### Run the Full Transient Optimization Suite:
-Automatically sweeps micro-batch sizes, BEAM compiler levels, and SwiGLU activation fusion, locking winning parameters into `best_config.json`:
+Automatically sweeps micro-batch sizes, BEAM compiler levels, and SwiGLU activation fusion, locking winning parameters into `conf/best_config.json`:
 ```bash
-uv run python harness.py --run-suite
+uv run python src/harness.py --run-suite
 ```
 
 #### Run BEAM & SwiGLU Suite Directly (Skip Micro-Batch Sweep):
 To keep fixed micro-batch size (`MICRO_BATCH_SIZE=64`, `GRAD_ACCUMULATION_STEPS=4`) and go directly to BEAM compiler search & SwiGLU optimization:
 ```bash
-BEAM_DEV_TIMEOUT=5 uv run python harness.py --run-suite --skip-batch-sweep
+BEAM_DEV_TIMEOUT=5 uv run python src/harness.py --run-suite --skip-batch-sweep
 ```
 
 #### Run Micro-Batch Sweep Only:
 ```bash
-python harness.py --sweep-batch
+python src/harness.py --sweep-batch
 ```
 
 #### Run Baseline Harness Execution:
 ```bash
-python harness.py
+python src/harness.py
 ```
 
-### 4. Stage 2: Production Model Training (`train_production.py`)
+### 4. Stage 2: Production Model Training (`src/train_production.py`)
 
-To launch a full production training run using `best_config.json`:
+To launch a full production training run using `conf/best_config.json`:
 
 ```bash
 # Train 125M Model (500 steps default)
-python train_production.py --model-size 125M --total-steps 500
+python src/train_production.py --model-size 125M --total-steps 500
 
 # Specify custom checkpoint directory and eval interval
-python train_production.py --model-size 125M --total-steps 2000 --eval-interval 100 --checkpoint-dir checkpoints
+python src/train_production.py --model-size 125M --total-steps 2000 --eval-interval 100 --checkpoint-dir checkpoints
 ```
 
 ---
 
-## Configuration Reference (`config.json` / `best_config.json`)
+## Configuration Reference (`conf/config.json` / `conf/best_config.json`)
 
 | Parameter | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
@@ -131,4 +158,4 @@ python train_production.py --model-size 125M --total-steps 2000 --eval-interval 
 ## Verification & Troubleshooting
 
 - **Linting & Code Formatting**: Run `./lint.sh` before submitting code changes.
-- **Check score telemetry**: Detailed execution telemetry is exported to `score.json` after harness runs.
+- **Check score telemetry**: Detailed execution telemetry is exported to `conf/score.json` after harness runs.

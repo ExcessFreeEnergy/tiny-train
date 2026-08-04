@@ -1,0 +1,3 @@
+"""
+tiny-train package module
+"""

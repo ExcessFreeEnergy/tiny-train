@@ -14,7 +14,12 @@ import sys
 import time
 
 
-def load_config(config_path: str = "config.json") -> dict:
+def load_config(config_path: str = "conf/config.json") -> dict:
+    if not os.path.exists(config_path):
+        for alt_path in ["config.json", "conf/best_config.json", "best_config.json"]:
+            if os.path.exists(alt_path):
+                config_path = alt_path
+                break
     if os.path.exists(config_path):
         with open(config_path) as f:
             return json.load(f)
@@ -114,7 +119,7 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     return base_metrics
 
 
-def run_harness(config_path: str = "config.json", timeout_sec: int = 3600, beam_dev_timeout: int | None = None) -> dict:
+def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, beam_dev_timeout: int | None = None) -> dict:
     config = load_config(config_path)
     print("=== Tinygrad Training Optimization Harness ===")
     print(f"Configuration: {json.dumps(config, indent=2)}")
@@ -133,8 +138,12 @@ def run_harness(config_path: str = "config.json", timeout_sec: int = 3600, beam_
     env["DEFAULT_FLOAT"] = str(config.get("DEFAULT_FLOAT", "BFLOAT16"))
     env["JIT"] = str(config.get("JIT", 1))
 
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    env["PYTHONPATH"] = f"{project_root}:{os.path.dirname(__file__)}:{env.get('PYTHONPATH', '')}"
+
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_production.py")
     num_steps = str(config.get("NUM_STEPS", 10))
-    cmd = [sys.executable, "train_production.py", "--model-size", "125M", "--total-steps", num_steps]
+    cmd = [sys.executable, script_path, "--model-size", "125M", "--total-steps", num_steps]
     print(f"\nExecuting payload: {' '.join(cmd)}")
     print(f"⏱️ Hard Timeout Limit: {timeout_sec}s ({timeout_sec // 60} minutes max per run)\n")
     t0 = time.time()
@@ -203,7 +212,8 @@ def run_harness(config_path: str = "config.json", timeout_sec: int = 3600, beam_
             else:
                 metrics["nan_detected"] = True
 
-    score_file = "score.json"
+    score_file = "conf/score.json"
+    os.makedirs(os.path.dirname(score_file), exist_ok=True)
     with open(score_file, "w") as f:
         json.dump(metrics, f, indent=2)
 
@@ -229,11 +239,12 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
         config["BEAM"] = 0
         config["NUM_STEPS"] = 3
 
-        with open("config.json", "w") as f:
+        os.makedirs("conf", exist_ok=True)
+        with open("conf/config.json", "w") as f:
             json.dump(config, f, indent=2)
 
         print(f"\n[SWEEP] Testing MICRO_BATCH_SIZE={test_batch} (GRAD_ACCUM={config['GRAD_ACCUMULATION_STEPS']})...")
-        metrics = run_harness("config.json", beam_dev_timeout=beam_dev_timeout)
+        metrics = run_harness("conf/config.json", beam_dev_timeout=beam_dev_timeout)
 
         if metrics.get("oom_detected") or metrics.get("nan_detected"):
             print(f"[OOM/Instability] Hit limit at MICRO_BATCH_SIZE={test_batch}")
@@ -258,7 +269,8 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
     final_cfg = copy.deepcopy(base_config)
     final_cfg["MICRO_BATCH_SIZE"] = best_batch
     final_cfg["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // best_batch)
-    with open("config.json", "w") as f:
+    os.makedirs("conf", exist_ok=True)
+    with open("conf/config.json", "w") as f:
         json.dump(final_cfg, f, indent=2)
 
     return best_batch
@@ -298,10 +310,11 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
         print(f"\n[BEAM SWEEP] Evaluating BEAM={beam_val}...")
         current_config["BEAM"] = beam_val
         current_config["NUM_STEPS"] = 3
-        with open("config.json", "w") as f:
+        os.makedirs("conf", exist_ok=True)
+        with open("conf/config.json", "w") as f:
             json.dump(current_config, f, indent=2)
 
-        m = run_harness("config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
+        m = run_harness("conf/config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
         step_ms = m.get("step_time_ms", 99999.0)
         gflops = m.get("peak_gflops", 0.0)
         mfu = m.get("mfu_pct", 0.0)
@@ -319,11 +332,12 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
     print("\n🔍 === Phase 3: SwiGLU Activation Fusion Evaluation ===")
     for swiglu_val in [1, 0]:
         current_config["USE_SWIGLU"] = swiglu_val
-        with open("config.json", "w") as f:
+        os.makedirs("conf", exist_ok=True)
+        with open("conf/config.json", "w") as f:
             json.dump(current_config, f, indent=2)
 
         print(f"\n[SWIGLU EVAL] Testing USE_SWIGLU={swiglu_val}...")
-        m = run_harness("config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
+        m = run_harness("conf/config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
         step_ms = m.get("step_time_ms", 99999.0)
         gflops = m.get("peak_gflops", 0.0)
         mfu = m.get("mfu_pct", 0.0)
@@ -335,14 +349,15 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
             break
 
     # Save final optimized configuration
-    with open("config.json", "w") as f:
+    os.makedirs("conf", exist_ok=True)
+    with open("conf/config.json", "w") as f:
         json.dump(current_config, f, indent=2)
-    with open("best_config.json", "w") as f:
+    with open("conf/best_config.json", "w") as f:
         json.dump(current_config, f, indent=2)
 
     print("\n=======================================================")
     print("🏆 TRANSIENT HARNESS SUITE COMPLETE!")
-    print("Optimal Configuration Saved to 'best_config.json':")
+    print("Optimal Configuration Saved to 'conf/best_config.json':")
     print(json.dumps(current_config, indent=2))
     print("=======================================================\n")
 
@@ -369,7 +384,7 @@ def main():
     elif args.sweep_batch:
         find_optimal_batch_size(cfg, beam_dev_timeout=beam_timeout)
     else:
-        run_harness("config.json", timeout_sec=args.timeout, beam_dev_timeout=beam_timeout)
+        run_harness("conf/config.json", timeout_sec=args.timeout, beam_dev_timeout=beam_timeout)
 
 
 if __name__ == "__main__":

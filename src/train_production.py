@@ -21,6 +21,9 @@ import time
 # Add this immediately to prevent TinyJit AST traversal from crashing
 sys.setrecursionlimit(10000)
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 import numpy as np
 from tinygrad import Tensor, TinyJit, dtypes
 from tinygrad.device import Device
@@ -30,9 +33,12 @@ from tinygrad.nn.state import get_parameters, get_state_dict, safe_save
 from model import GPT
 
 
-def load_best_config(config_path: str = "best_config.json") -> dict:
+def load_best_config(config_path: str = "conf/best_config.json") -> dict:
     if not os.path.exists(config_path):
-        config_path = "config.json"
+        for alt_path in ["conf/config.json", "best_config.json", "config.json"]:
+            if os.path.exists(alt_path):
+                config_path = alt_path
+                break
     with open(config_path) as f:
         return json.load(f)
 
