@@ -128,7 +128,7 @@ def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, 
     env["DEBUG"] = "2"
     env["TINYCACHE"] = "1"
     # Prevents buffer overflows on 700+ kernel queues
-    env["HCQ"] = "0"
+    env["HCQ"] = "1"
     env["BEAM"] = str(config.get("BEAM", 2))
     if beam_dev_timeout is not None:
         env["BEAM_DEV_TIMEOUT"] = str(beam_dev_timeout)
@@ -301,9 +301,9 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
         current_config["MICRO_BATCH_SIZE"] = winning_batch
         current_config["GRAD_ACCUMULATION_STEPS"] = max(1, 256 // winning_batch)
 
-    # 2. BEAM Compiler Search Phase (BEAM=0 -> 2 -> 4)
+    # 2. BEAM Compiler Search Phase (Skip 0, jump to 2 -> 4)
     print("\n🔍 === Phase 2: BEAM Compiler Search Sweep (BEAM=0 -> 2 -> 4) ===")
-    best_beam = 0
+    best_beam = 2
     best_step_time = 99999.0
 
     for beam_val in [0, 2, 4]:
