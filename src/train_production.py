@@ -163,13 +163,13 @@ def main():
         scaled_loss = loss * loss_scale
         scaled_loss.backward()
 
-        # SEVER BACKWARD/OPTIMIZER GRAPH: Realize gradients into VRAM
+        # SEVER BACKWARD/OPTIMIZER GRAPH: Realize gradients AND loss into VRAM
         # so AdamW operates on a fresh, shallow graph.
         grads = [p.grad for p in params if p.grad is not None]
-        Tensor.realize(*grads)
+        Tensor.realize(loss, *grads)
 
         # Now schedule weight updates on a shallow, independent graph
-        Tensor.realize(loss, *optimizer.schedule_step())
+        Tensor.realize(*optimizer.schedule_step())
         return loss
 
     # 1. Fetch a single initialization batch
