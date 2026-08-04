@@ -28,7 +28,7 @@ def load_config(config_path: str = "conf/config.json") -> dict:
         "GRAD_ACCUMULATION_STEPS": 4,
         "DEFAULT_FLOAT": "BFLOAT16",
         "ALLOW_TF32": 1,
-        "BEAM": 0,
+        "BEAM": 2,
         "JIT": 1,
         "USE_SWIGLU": 0,
         "USE_ROPE": 1,
@@ -236,7 +236,7 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
         config = copy.deepcopy(base_config)
         config["MICRO_BATCH_SIZE"] = test_batch
         config["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // test_batch)
-        config["BEAM"] = 0
+        config["BEAM"] = 2
         config["NUM_STEPS"] = 3
 
         os.makedirs("conf", exist_ok=True)
@@ -306,7 +306,7 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
     best_beam = 2
     best_step_time = 99999.0
 
-    for beam_val in [0, 2, 4]:
+    for beam_val in [2, 4]:
         print(f"\n[BEAM SWEEP] Evaluating BEAM={beam_val}...")
         current_config["BEAM"] = beam_val
         current_config["NUM_STEPS"] = 3
