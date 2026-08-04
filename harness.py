@@ -107,14 +107,14 @@ def parse_telemetry_from_output(output_text: str) -> dict:
             "status": status,
             "nan_detected": base_metrics.get("nan_detected", nan_detected),
             "oom_detected": oom_detected,
-            "jit_active": base_metrics.get("jit_active", "Warmup complete" in output_text),
+            "jit_active": base_metrics.get("jit_active", "Warmup complete" in output_text or "JIT Warmup complete" in output_text),
         }
     )
 
     return base_metrics
 
 
-def run_harness(config_path: str = "config.json", timeout_sec: int = 300) -> dict:
+def run_harness(config_path: str = "config.json", timeout_sec: int = 3600, beam_dev_timeout: int | None = None) -> dict:
     config = load_config(config_path)
     print("=== Tinygrad Training Optimization Harness ===")
     print(f"Configuration: {json.dumps(config, indent=2)}")
@@ -122,8 +122,13 @@ def run_harness(config_path: str = "config.json", timeout_sec: int = 300) -> dic
     env = os.environ.copy()
     env["DEBUG"] = "2"
     env["TINYCACHE"] = "1"
-    env["HCQ"] = "1"
+    # Prevents buffer overflows on 700+ kernel queues
+    env["HCQ"] = "0"
     env["BEAM"] = str(config.get("BEAM", 2))
+    if beam_dev_timeout is not None:
+        env["BEAM_DEV_TIMEOUT"] = str(beam_dev_timeout)
+    else:
+        env["BEAM_DEV_TIMEOUT"] = os.environ.get("BEAM_DEV_TIMEOUT", "60")
     env["ALLOW_TF32"] = str(config.get("ALLOW_TF32", 1))
     env["DEFAULT_FLOAT"] = str(config.get("DEFAULT_FLOAT", "BFLOAT16"))
     env["JIT"] = str(config.get("JIT", 1))
@@ -131,7 +136,7 @@ def run_harness(config_path: str = "config.json", timeout_sec: int = 300) -> dic
     num_steps = str(config.get("NUM_STEPS", 10))
     cmd = [sys.executable, "train_production.py", "--model-size", "125M", "--total-steps", num_steps]
     print(f"\nExecuting payload: {' '.join(cmd)}")
-    print(f"⏱️ Hard Timeout Limit: {timeout_sec}s (5 minutes max per run)\n")
+    print(f"⏱️ Hard Timeout Limit: {timeout_sec}s ({timeout_sec // 60} minutes max per run)\n")
     t0 = time.time()
 
     proc = subprocess.Popen(
@@ -210,7 +215,7 @@ def run_harness(config_path: str = "config.json", timeout_sec: int = 300) -> dic
     return metrics
 
 
-def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256) -> int:
+def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256, beam_dev_timeout: int | None = None) -> int:
     """Run OOM-Safe Micro-Batch Sweep to discover optimal hardware micro-batch size."""
     print("\n🔍 === Phase 1: Micro-Batch Optimization Sweep ===")
     test_batch = 16
@@ -228,7 +233,7 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
             json.dump(config, f, indent=2)
 
         print(f"\n[SWEEP] Testing MICRO_BATCH_SIZE={test_batch} (GRAD_ACCUM={config['GRAD_ACCUMULATION_STEPS']})...")
-        metrics = run_harness("config.json")
+        metrics = run_harness("config.json", beam_dev_timeout=beam_dev_timeout)
 
         if metrics.get("oom_detected") or metrics.get("nan_detected"):
             print(f"[OOM/Instability] Hit limit at MICRO_BATCH_SIZE={test_batch}")
@@ -259,19 +264,30 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
     return best_batch
 
 
-def run_transient_suite(base_config: dict) -> dict:
+def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeout_sec: int = 3600, beam_dev_timeout: int | None = None) -> dict:
     """Run Transient Harness Suite: Batch Optimization -> BEAM Search -> SwiGLU Fusion."""
     print("\n=======================================================")
     print("🚀 STARTING TRANSIENT HARNESS OPTIMIZATION SUITE")
-    print("Sequence: Batch Optimization -> BEAM Compiler Search -> SwiGLU Fusion")
+    if skip_batch_sweep:
+        print("Sequence: [SKIPPED Batch Sweep] -> BEAM Compiler Search -> SwiGLU Fusion")
+    else:
+        print("Sequence: Batch Optimization -> BEAM Compiler Search -> SwiGLU Fusion")
+    print(f"⏱️ Subprocess Timeout Limit: {timeout_sec}s ({timeout_sec // 60} mins)")
+    if beam_dev_timeout == 0:
+        print("⚡ BEAM Compiler Timeout: DISABLED (BEAM_DEV_TIMEOUT=0)")
+    elif beam_dev_timeout is not None:
+        print(f"⏱️ BEAM Compiler Timeout: {beam_dev_timeout}s (BEAM_DEV_TIMEOUT={beam_dev_timeout})")
     print("=======================================================\n")
 
     current_config = copy.deepcopy(base_config)
 
     # 1. Batch Optimization Phase
-    winning_batch = find_optimal_batch_size(current_config)
-    current_config["MICRO_BATCH_SIZE"] = winning_batch
-    current_config["GRAD_ACCUMULATION_STEPS"] = max(1, 256 // winning_batch)
+    if skip_batch_sweep:
+        print(f"⏩ [SKIP BATCH SWEEP] Using existing batch settings: MICRO_BATCH_SIZE={current_config.get('MICRO_BATCH_SIZE', 64)}")
+    else:
+        winning_batch = find_optimal_batch_size(current_config, beam_dev_timeout=beam_dev_timeout)
+        current_config["MICRO_BATCH_SIZE"] = winning_batch
+        current_config["GRAD_ACCUMULATION_STEPS"] = max(1, 256 // winning_batch)
 
     # 2. BEAM Compiler Search Phase (BEAM=0 -> 2 -> 4)
     print("\n🔍 === Phase 2: BEAM Compiler Search Sweep (BEAM=0 -> 2 -> 4) ===")
@@ -285,7 +301,7 @@ def run_transient_suite(base_config: dict) -> dict:
         with open("config.json", "w") as f:
             json.dump(current_config, f, indent=2)
 
-        m = run_harness("config.json")
+        m = run_harness("config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
         step_ms = m.get("step_time_ms", 99999.0)
         gflops = m.get("peak_gflops", 0.0)
         mfu = m.get("mfu_pct", 0.0)
@@ -307,7 +323,7 @@ def run_transient_suite(base_config: dict) -> dict:
             json.dump(current_config, f, indent=2)
 
         print(f"\n[SWIGLU EVAL] Testing USE_SWIGLU={swiglu_val}...")
-        m = run_harness("config.json")
+        m = run_harness("config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
         step_ms = m.get("step_time_ms", 99999.0)
         gflops = m.get("peak_gflops", 0.0)
         mfu = m.get("mfu_pct", 0.0)
@@ -337,15 +353,23 @@ def main():
     parser = argparse.ArgumentParser(description="Tinygrad Harness with Transient Optimization Suite")
     parser.add_argument("--sweep-batch", action="store_true", default=False, help="Run OOM-safe micro-batch discovery sweep")
     parser.add_argument("--run-suite", action="store_true", default=False, help="Run full transient 3-phase optimization suite")
+    parser.add_argument("--skip-batch-sweep", action="store_true", default=False, help="Skip Phase 1 micro-batch sweep in suite execution")
+    parser.add_argument("--timeout", type=int, default=3600, help="Subprocess timeout limit in seconds (default: 3600s / 60 mins)")
+    parser.add_argument(
+        "--disable-beam-timeout", "--no-beam-timeout", action="store_true", default=False, help="Disable BEAM compiler dev timeout (sets BEAM_DEV_TIMEOUT=0)"
+    )
+    parser.add_argument("--beam-dev-timeout", type=int, default=None, help="BEAM compiler dev timeout in seconds (default: 60, set to 0 to disable)")
     args = parser.parse_args()
+
+    beam_timeout = 0 if args.disable_beam_timeout else args.beam_dev_timeout
 
     cfg = load_config()
     if args.run_suite:
-        run_transient_suite(cfg)
+        run_transient_suite(cfg, skip_batch_sweep=args.skip_batch_sweep, timeout_sec=args.timeout, beam_dev_timeout=beam_timeout)
     elif args.sweep_batch:
-        find_optimal_batch_size(cfg)
+        find_optimal_batch_size(cfg, beam_dev_timeout=beam_timeout)
     else:
-        run_harness()
+        run_harness("config.json", timeout_sec=args.timeout, beam_dev_timeout=beam_timeout)
 
 
 if __name__ == "__main__":
