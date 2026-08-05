@@ -58,6 +58,18 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 
 ---
 
+## ⚡ Gigatoken Dataset Tokenization & Preprocessing Optimizations
+
+The preprocessing pipeline integrates `gigatoken` (`src/retokenize.py`), achieving ~1000× faster encoding throughput than HuggingFace tokenizers (up to GB/s processing speeds):
+
+1. **Custom SIMD Pretokenization**: Replaces traditional Regex-based pretokenization engines with custom SIMD implementations (AVX-512 / AVX2 / NEON) to eliminate branch mispredictions and maximize CPU byte processing.
+2. **Pretoken Cache Hierarchy**: Highly optimized, multi-tiered cache hierarchy for pretoken mappings, efficiently handling long-tailed word-to-token distributions.
+3. **Direct Rust Native Streaming**: Bypasses CPython ABI/GIL overhead using native file sources (`TextFileSource`, `JsonlFileSource`, `ParquetFileSource`) to read and tokenize directly in Rust.
+4. **Thread Isolation & Memory Allocation Minimization**: Minimizes inter-thread communication bottlenecks and avoids unnecessary heap allocations during file encoding.
+5. **Vocabulary Trimming Integration (`--trim-vocab`)**: Detects and removes unused ("dead") tokens from the vocabulary, shrinking the embedding weight matrix (`wte`) in memory and accelerating downstream Transformer compute.
+
+---
+
 ## 🛠️ Summary of Code Review Fixes (`tinygrad` Speedup)
 
 1. **Fixed LM Head FP32 Cast**:
@@ -68,4 +80,3 @@ This document tracks cumulative performance benchmarks, architectural refactorin
    - Adding `Tensor.realize(loss, *params)` inside `raw_step()` guaranteed weight updates (`p.assign(...)`) were compiled and realized within the `@TinyJit` graph.
 4. **Harness Real-Time Streaming & Timeout Guard**:
    - Streams every execution line in real-time to stdout with live status heartbeats and a strict 5-minute timeout guard (`timeout_sec=300`).
-
