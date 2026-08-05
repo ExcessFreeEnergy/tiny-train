@@ -12,17 +12,20 @@ High-performance, hardware-optimized Transformer model training engine built on 
 
 ## Performance Optimizations Implemented
 
-1. **Simultaneous Loss & Weight Realization (Optimizer Graph Bloat Fix)**:
-   In `@TinyJit` step functions, calling `Tensor.realize(loss, *optimizer.params)` forces lazy execution of both the loss reduction and weight assignment graphs simultaneously, preventing un-executed computation nodes from accumulating in memory.
+1. **Split JIT Gradient Accumulation & In-Place Zeroing**:
+   Separates gradient accumulation into a micro-batch pass (`accum_step`) and optimizer update (`opt_step`), executing accumulation in Python. Pre-allocates `.grad` zero tensors and uses `.assign()` for in-place zeroing to preserve static `TinyJit` buffer references without graph unrolling bloat or driver timeouts.
 
-2. **Pre-Casted Fused RoPE Buffers**:
-   Static Rotary Position Embedding (RoPE) `cos` and `sin` tables are pre-cast to `dtypes.default_float` during initialization in `precompute_freqs_cis`. This removes runtime `.cast()` operations inside `apply_rope()`, eliminating hundreds of unnecessary cast nodes from the JIT compilation graph.
+2. **Static Input Tensor Realization**:
+   Passes `.contiguous().realize()` micro-batch slice inputs to `@TinyJit` functions, guaranteeing static tensor shapes `(MICRO_BATCH_SIZE, SEQUENCE_LENGTH)` and zero offset metadata across all micro-batch iterations.
 
-3. **Hardware Saturation (Micro-Batch Saturation)**:
-   Micro-batch size is scaled to `MICRO_BATCH_SIZE=64` (or 128) to ensure high matrix multiplication dimensions per kernel pass, maximizing Ada Lovelace Tensor Core utilization and reducing driver dispatch overhead.
+3. **Pre-Casted Fused RoPE Cache Buffers**:
+   Static Rotary Position Embedding (RoPE) `cos` and `sin` tables are pre-cast to `dtypes.default_float` during initialization in `precompute_freqs_cis`. This removes runtime `.cast()` operations inside `apply_rope()`, eliminating hundreds of unnecessary cast nodes from the JIT graph.
 
 4. **Tensor Core 128 Alignment & SwiGLU Fusion**:
    All model dimensions (`d_model`, `d_head`, `d_ff`, `vocab_size`) are padded to multiples of 128 for optimal hardware alignment. SwiGLU activations boost arithmetic intensity.
+
+5. **High-Speed SIMD Tokenization & Vocabulary Trimming**:
+   Integrates Gigatoken (`src/retokenize.py`) for SIMD-accelerated pretokenization (AVX-512/AVX2/NEON) and vocabulary trimming (`--trim-vocab`), eliminating dead tokens and shrinking embedding matrix memory (`wte`).
 
 ---
 
