@@ -6,8 +6,11 @@ Supports Tensor Core 64/128 alignment, Fused RoPE, RMSNorm, FlashAttention SDPA,
 from tinygrad import Tensor, dtypes
 
 
-def pad_vocab_size(vocab_size: int, multiple: int = 128) -> int:
-    """Pad vocabulary size to a multiple of 128 for Tensor Core alignment."""
+def pad_vocab_size(vocab_size: int, multiple: int = 128, power_of_two: bool = True) -> int:
+    """Pad vocabulary size to a clean power of 2 (e.g. 16384) or multiple of 128 for optimal BEAM reduction tiling."""
+    if power_of_two:
+        p2 = 1 << (vocab_size - 1).bit_length()
+        return max(p2, multiple)
     if vocab_size % multiple == 0:
         return vocab_size
     return ((vocab_size + multiple - 1) // multiple) * multiple
@@ -124,9 +127,10 @@ class GPT:
         use_swiglu: bool = False,
         use_rope: bool = True,
         pad_vocab_multiple: int = 128,
+        pad_vocab_power_of_2: bool = True,
     ):
         self.raw_vocab_size = vocab_size
-        self.vocab_size = pad_vocab_size(vocab_size, pad_vocab_multiple)
+        self.vocab_size = pad_vocab_size(vocab_size, pad_vocab_multiple, power_of_two=pad_vocab_power_of_2)
         self.d_model = d_model
         self.n_heads = n_heads
         self.use_rope = use_rope

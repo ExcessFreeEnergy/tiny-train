@@ -68,8 +68,10 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 - **Rule 6:** ALWAYS split `@TinyJit` into `accum_step` (micro-batch forward/backward pass) and `opt_step` (optimizer step + in-place gradient zeroing via `.assign()`).
 - **Rule 7:** Pre-allocate `.grad` zero tensors for all parameters after weight realization, and pass `.contiguous().realize()` micro-batch slices to guarantee static JIT input tensor metadata.
 
-### D. Code Quality & Linter Compliance
+### D. Code Quality & Execution Environment
 - **Rule 8:** Code MUST pass `./lint.sh` (`uv run ruff check --fix .` and `uv run ruff format .`) with zero errors or warnings before committing.
+- **Rule 9:** ALWAYS use `uv run python` (never plain `python`) when executing Python scripts, commands, tests, or harness runs.
+
 
 ---
 

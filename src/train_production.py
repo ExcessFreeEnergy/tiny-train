@@ -67,6 +67,9 @@ def main():
 
     config = load_best_config()
 
+    beam_val = str(config.get("BEAM", 4))
+    os.environ["BEAM"] = os.environ.get("BEAM", beam_val)
+
     default_float_str = str(config.get("DEFAULT_FLOAT", "BFLOAT16")).upper()
     if default_float_str == "HALF":
         dtypes.default_float = dtypes.half
@@ -103,6 +106,7 @@ def main():
     use_swiglu = bool(config.get("USE_SWIGLU", 1))
     use_rope = bool(config.get("USE_ROPE", 1))
     pad_vocab_mult = int(config.get("PAD_VOCAB_MULTIPLE", 128))
+    pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 1))
     use_jit = bool(config.get("JIT", 1))
 
     train_bin = "data/TinyStories/train_trimmed.bin"
@@ -133,6 +137,7 @@ def main():
         use_swiglu=use_swiglu,
         use_rope=use_rope,
         pad_vocab_multiple=pad_vocab_mult,
+        pad_vocab_power_of_2=pad_vocab_p2,
     )
     param_count = model.num_params()
     print("\n=======================================================")
@@ -165,21 +170,35 @@ def main():
         y_np = chunk[1:].reshape(eff_batch_size, seq_len)
         return Tensor(x_np).realize(), Tensor(y_np).realize()
 
+    CHUNK_SIZE = min(4, micro_batch_size)
+
     def accum_step(x_micro: Tensor, y_micro: Tensor) -> Tensor:
-        logits = model.forward(x_micro)
+        total_loss = Tensor.zeros(1, dtype=dtypes.float, device=x_micro.device)
+        num_chunks = max(1, x_micro.shape[0] // CHUNK_SIZE)
 
-        # CRITICAL: .contiguous() MUST stay here. It acts as a memory
-        # write barrier to prevent the AST compiler from exploding!
-        flat_logits = logits.reshape(-1, logits.shape[-1]).contiguous()
-        flat_y = y_micro.flatten()
+        for c in range(num_chunks):
+            x_chunk = x_micro[c * CHUNK_SIZE : (c + 1) * CHUNK_SIZE]
+            y_chunk = y_micro[c * CHUNK_SIZE : (c + 1) * CHUNK_SIZE]
 
-        loss = flat_logits.sparse_categorical_crossentropy(flat_y) / grad_accum_steps
-        scaled_loss = loss * loss_scale
-        scaled_loss.backward()
+            # 1. Forward pass for 1,024 tokens -> 28.8 MB logits (Fits in 48MB L2)
+            logits_chunk = model.forward(x_chunk)
+            flat_logits = logits_chunk.reshape(-1, logits_chunk.shape[-1])
+            flat_y = y_chunk.flatten()
 
-        grads = [p.grad for p in params if p.grad is not None]
-        Tensor.realize(loss, *grads)
-        return loss
+            # 2. Compute chunk loss
+            chunk_loss = flat_logits.sparse_categorical_crossentropy(flat_y) / (grad_accum_steps * num_chunks)
+            scaled_loss = chunk_loss * loss_scale
+
+            # 3. Backward pass accumulates gradients directly into p.grad
+            scaled_loss.backward()
+
+            # 4. Realize gradients and chunk loss per iteration to break AST graph explosion
+            c_loss = chunk_loss.detach()
+            grads = [p.grad for p in params if p.grad is not None]
+            Tensor.realize(c_loss, *grads)
+            total_loss += c_loss
+
+        return total_loss
 
     def opt_step():
         Tensor.realize(*optimizer.schedule_step())

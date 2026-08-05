@@ -198,6 +198,7 @@ def main():
             "USE_SWIGLU": 0,
             "USE_ROPE": 1,
             "PAD_VOCAB_MULTIPLE": 128,
+            "PAD_VOCAB_POWER_OF_2": 1,
             "SEQUENCE_LENGTH": 256,
             "LEARNING_RATE": 1e-3,
             "NUM_STEPS": 20,

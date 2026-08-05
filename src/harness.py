@@ -22,28 +22,36 @@ def load_config(config_path: str = "conf/config.json") -> dict:
                 break
     if os.path.exists(config_path):
         with open(config_path) as f:
-            return json.load(f)
-    return {
-        "MICRO_BATCH_SIZE": 16,
-        "GRAD_ACCUMULATION_STEPS": 4,
-        "DEFAULT_FLOAT": "BFLOAT16",
-        "ALLOW_TF32": 1,
-        "BEAM": 4,
-        "TC": 1,
-        "TENSOR_CORES": 1,
-        "JIT": 1,
-        "USE_SWIGLU": 1,
-        "USE_ROPE": 1,
-        "PAD_VOCAB_MULTIPLE": 128,
-        "SEQUENCE_LENGTH": 256,
-        "LEARNING_RATE": 1e-3,
-        "NUM_STEPS": 20,
-        "VOCAB_SIZE": 13970,
-        "D_MODEL": 768,
-        "N_LAYERS": 12,
-        "N_HEADS": 12,
-        "D_FF": 3072,
-    }
+            cfg = json.load(f)
+    else:
+        cfg = {
+            "MICRO_BATCH_SIZE": 16,
+            "GRAD_ACCUMULATION_STEPS": 4,
+            "DEFAULT_FLOAT": "BFLOAT16",
+            "ALLOW_TF32": 1,
+            "BEAM": 4,
+            "TC": 1,
+            "TENSOR_CORES": 1,
+            "JIT": 1,
+            "USE_SWIGLU": 1,
+            "USE_ROPE": 1,
+            "PAD_VOCAB_MULTIPLE": 128,
+            "PAD_VOCAB_POWER_OF_2": 1,
+            "SEQUENCE_LENGTH": 256,
+            "LEARNING_RATE": 1e-3,
+            "NUM_STEPS": 20,
+            "VOCAB_SIZE": 13970,
+            "D_MODEL": 768,
+            "N_LAYERS": 12,
+            "N_HEADS": 12,
+            "D_FF": 3072,
+        }
+    if "BEAM" in os.environ:
+        try:
+            cfg["BEAM"] = int(os.environ["BEAM"])
+        except ValueError:
+            cfg["BEAM"] = os.environ["BEAM"]
+    return cfg
 
 
 def parse_telemetry_from_output(output_text: str) -> dict:
@@ -131,7 +139,7 @@ def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, 
     env["TINYCACHE"] = "1"
     # Prevents buffer overflows on 700+ kernel queues
     env["HCQ"] = "1"
-    env["BEAM"] = str(config.get("BEAM", 4))
+    env["BEAM"] = os.environ.get("BEAM", str(config.get("BEAM", 4)))
     env["TC"] = str(config.get("TC", 1))
     env["TENSOR_CORES"] = str(config.get("TENSOR_CORES", 1))
     if beam_dev_timeout is not None:
@@ -240,7 +248,13 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
         config = copy.deepcopy(base_config)
         config["MICRO_BATCH_SIZE"] = test_batch
         config["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // test_batch)
-        config["BEAM"] = 2
+        if "BEAM" in os.environ:
+            try:
+                config["BEAM"] = int(os.environ["BEAM"])
+            except ValueError:
+                config["BEAM"] = os.environ["BEAM"]
+        else:
+            config["BEAM"] = base_config.get("BEAM", 2)
         config["NUM_STEPS"] = 3
 
         os.makedirs("conf", exist_ok=True)
@@ -305,12 +319,22 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
         current_config["MICRO_BATCH_SIZE"] = winning_batch
         current_config["GRAD_ACCUMULATION_STEPS"] = max(1, 256 // winning_batch)
 
-    # 2. BEAM Compiler Search Phase (Skip 0, jump to 2 -> 4)
-    print("\n🔍 === Phase 2: BEAM Compiler Search Sweep (BEAM=0 -> 2 -> 4) ===")
-    best_beam = 2
+    # 2. BEAM Compiler Search Phase (BEAM=0 -> 1 -> 2 -> 4)
+    print("\n🔍 === Phase 2: BEAM Compiler Search Sweep (BEAM=0 -> 1 -> 2 -> 4) ===")
+    best_beam = 0
     best_step_time = 99999.0
 
-    for beam_val in [2, 4]:
+    beam_candidates = [0, 1, 2, 4]
+    if "BEAM" in os.environ:
+        try:
+            env_beam_val = int(os.environ["BEAM"])
+            if env_beam_val not in beam_candidates:
+                beam_candidates.append(env_beam_val)
+                beam_candidates.sort()
+        except ValueError:
+            pass
+
+    for beam_val in beam_candidates:
         print(f"\n[BEAM SWEEP] Evaluating BEAM={beam_val}...")
         current_config["BEAM"] = beam_val
         current_config["NUM_STEPS"] = 3
