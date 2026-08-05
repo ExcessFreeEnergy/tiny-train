@@ -14,6 +14,8 @@ import os
 os.environ["ALLOW_TF32"] = os.environ.get("ALLOW_TF32", "1")
 os.environ["TINYCACHE"] = os.environ.get("TINYCACHE", "1")
 os.environ["HCQ"] = os.environ.get("HCQ", "1")
+os.environ["TC"] = "1"
+os.environ["TENSOR_CORES"] = "1"
 
 import sys
 import time
@@ -44,6 +46,8 @@ def load_best_config(config_path: str = "conf/best_config.json") -> dict:
 
 
 def get_lr_schedule(it: int, max_iters: int, warmup_iters: int, max_lr: float, min_lr: float) -> float:
+    if warmup_iters <= 0 or max_iters <= warmup_iters:
+        return max_lr
     if it < warmup_iters:
         return max_lr * (it + 1) / warmup_iters
     if it > max_iters:
@@ -74,7 +78,9 @@ def main():
         dtypes.default_float = dtypes.float
         loss_scale = 1.0
 
-    batch_size = int(config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 64)))
+    micro_batch_size = int(config.get("MICRO_BATCH_SIZE", config.get("BATCH_SIZE", 16)))
+    grad_accum_steps = int(config.get("GRAD_ACCUMULATION_STEPS", 4))
+    eff_batch_size = micro_batch_size * grad_accum_steps
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
     max_lr = float(config.get("LEARNING_RATE", 1e-3))
     min_lr = max_lr * 0.1
@@ -132,7 +138,7 @@ def main():
     print("\n=======================================================")
     print(f"🚀 MAIN PRODUCTION TRAINER INITIALIZED ({args.model_size})")
     print(f"Parameters: {param_count:,} | Padded Vocab: {model.vocab_size}")
-    print(f"Batch Size: {batch_size} | Sequence Length: {seq_len}")
+    print(f"Micro-Batch: {micro_batch_size} | Grad Accum: {grad_accum_steps} | Effective Batch: {eff_batch_size} | Seq Len: {seq_len}")
     print(f"Precision: {default_float_str} | RoPE: {use_rope} | SwiGLU: {use_swiglu}")
     print("=======================================================\n")
 
@@ -143,55 +149,73 @@ def main():
     sys.stderr.write("[train_production.py] Realizing model weights into VRAM...\n")
     Tensor.realize(*params)
 
+    # Pre-allocate gradient buffers as zeros
+    for p in params:
+        p.grad = Tensor.zeros(*p.shape, dtype=p.dtype, device=p.device).realize()
+
     optimizer = AdamW(params, lr=max_lr)
 
-    flops_per_step = 6.0 * param_count * batch_size * seq_len
+    flops_per_step = 6.0 * param_count * eff_batch_size * seq_len
 
     def get_batch(data_source: np.ndarray, step_idx: int):
         d_len = len(data_source)
-        offset = (step_idx * batch_size * seq_len) % (d_len - batch_size * seq_len - 1)
-        chunk = data_source[offset : offset + batch_size * seq_len + 1].astype(np.int32)
-        x_np = chunk[:-1].reshape(batch_size, seq_len)
-        y_np = chunk[1:].reshape(batch_size, seq_len)
+        offset = (step_idx * eff_batch_size * seq_len) % (d_len - eff_batch_size * seq_len - 1)
+        chunk = data_source[offset : offset + eff_batch_size * seq_len + 1].astype(np.int32)
+        x_np = chunk[:-1].reshape(eff_batch_size, seq_len)
+        y_np = chunk[1:].reshape(eff_batch_size, seq_len)
         return Tensor(x_np).realize(), Tensor(y_np).realize()
 
-    # Clean Single-Batch @TinyJit Function (Compiles in < 40s even with BEAM=2)
-    def raw_step(x: Tensor, y: Tensor) -> Tensor:
-        optimizer.zero_grad()
-        logits = model.forward(x)
-        loss = logits.sparse_categorical_crossentropy(y)
+    def accum_step(x_micro: Tensor, y_micro: Tensor) -> Tensor:
+        logits = model.forward(x_micro)
+
+        # CRITICAL: .contiguous() MUST stay here. It acts as a memory
+        # write barrier to prevent the AST compiler from exploding!
+        flat_logits = logits.reshape(-1, logits.shape[-1]).contiguous()
+        flat_y = y_micro.flatten()
+
+        loss = flat_logits.sparse_categorical_crossentropy(flat_y) / grad_accum_steps
         scaled_loss = loss * loss_scale
         scaled_loss.backward()
 
-        # SEVER BACKWARD/OPTIMIZER GRAPH: Realize gradients AND loss into VRAM
-        # so AdamW operates on a fresh, shallow graph.
         grads = [p.grad for p in params if p.grad is not None]
         Tensor.realize(loss, *grads)
-
-        # Now schedule weight updates on a shallow, independent graph
-        Tensor.realize(*optimizer.schedule_step())
         return loss
+
+    def opt_step():
+        Tensor.realize(*optimizer.schedule_step())
+        for p in params:
+            p.grad.assign(Tensor.zeros(*p.shape, dtype=p.dtype, device=p.device)).realize()
 
     # 1. Fetch a single initialization batch
     init_x, init_y = get_batch(train_data, 0)
 
     # 2. Run ONE uncompiled step to force AdamW to allocate momentum buffers
     sys.stderr.write("[train_production.py] Initializing optimizer states before JIT...\n")
-    raw_step(init_x, init_y)
+    for i in range(grad_accum_steps):
+        x_m = init_x[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
+        y_m = init_y[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
+        accum_step(x_m, y_m)
+    opt_step()
     Device[Device.DEFAULT].synchronize()
 
     # 3. NOW it is safe to lock the graph and wrap in TinyJit
     if use_jit:
-        step_fn = TinyJit(raw_step)
+        accum_fn = TinyJit(accum_step)
+        opt_fn = TinyJit(opt_step)
     else:
-        step_fn = raw_step
+        accum_fn = accum_step
+        opt_fn = opt_step
 
     # 4. Proceed with JIT warmup to trigger the actual kernel compilation
     sys.stderr.write("[train_production.py] Running JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
         xw, yw = get_batch(train_data, 100 + w)
-        _ = step_fn(xw, yw)
+        for i in range(grad_accum_steps):
+            x_m = xw[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
+            y_m = yw[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
+            _ = accum_fn(x_m, y_m)
+        opt_fn()
         Device[Device.DEFAULT].synchronize()
 
     # CRITICAL: This exact string allows harness.py to set jit_active=True
@@ -199,6 +223,7 @@ def main():
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     step_times = []
+    last_loss_val = 0.0
 
     # Production Training Loop
     for step in range(1, args.total_steps + 1):
@@ -208,7 +233,13 @@ def main():
         x_b, y_b = get_batch(train_data, step)
 
         t0 = time.time()
-        loss_tensor = step_fn(x_b, y_b)
+        micro_losses = []
+        for i in range(grad_accum_steps):
+            x_micro = x_b[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
+            y_micro = y_b[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
+            mloss = accum_fn(x_micro, y_micro)
+            micro_losses.append(mloss)
+        opt_fn()
         Device[Device.DEFAULT].synchronize()
         t1 = time.time()
 
@@ -216,8 +247,9 @@ def main():
         step_times.append(step_ms)
 
         if step == 1 or step == args.total_steps or step % 10 == 0:
-            loss_val = float(loss_tensor.cast(dtypes.float).item())
-            throughput = (batch_size / (step_ms / 1000.0)) if step_ms > 0 else 0.0
+            loss_val = float(sum(ml.cast(dtypes.float).item() for ml in micro_losses))
+            last_loss_val = loss_val
+            throughput = (eff_batch_size / (step_ms / 1000.0)) if step_ms > 0 else 0.0
             gflops = (flops_per_step / (step_ms / 1000.0)) / 1e9 if step_ms > 0 else 0.0
             mfu_pct = (gflops / 330000.0) * 100.0
 
@@ -229,8 +261,8 @@ def main():
         # Checkpointing & Validation Eval
         if step % args.eval_interval == 0 or step == args.total_steps:
             x_v, y_v = get_batch(valid_data, step + 999)
-            val_logits = model.forward(x_v)
-            val_loss_tensor = val_logits.sparse_categorical_crossentropy(y_v).realize()
+            val_logits = model.forward(x_v[:micro_batch_size])
+            val_loss_tensor = val_logits.sparse_categorical_crossentropy(y_v[:micro_batch_size]).realize()
             val_loss = float(val_loss_tensor.cast(dtypes.float).item())
             print(f"📊 Validation Loss at step {step}: {val_loss:.4f}")
 
@@ -240,7 +272,7 @@ def main():
             print(f"💾 Checkpoint saved to '{ckpt_path}'")
 
     avg_step_ms = float(np.mean(step_times[1:])) if len(step_times) > 1 else float(np.mean(step_times))
-    avg_tput = batch_size / (avg_step_ms / 1000.0)
+    avg_tput = eff_batch_size / (avg_step_ms / 1000.0)
     avg_gflops = (flops_per_step / (avg_step_ms / 1000.0)) / 1e9
     avg_mfu = (avg_gflops / 330000.0) * 100.0
 
@@ -249,12 +281,12 @@ def main():
         "peak_gflops": round(avg_gflops, 1),
         "mfu_pct": round(avg_mfu, 2),
         "avg_bandwidth_gbps": 0.0,
-        "final_loss": round(float(loss_tensor.cast(dtypes.float).item()), 4),
+        "final_loss": round(last_loss_val, 4),
         "nan_detected": False,
         "jit_active": use_jit,
-        "micro_batch_size": batch_size,
-        "grad_accumulation_steps": 1,
-        "effective_batch_size": batch_size,
+        "micro_batch_size": micro_batch_size,
+        "grad_accumulation_steps": grad_accum_steps,
+        "effective_batch_size": eff_batch_size,
         "padded_vocab_size": model.vocab_size,
     }
 

@@ -30,7 +30,7 @@ def load_config(config_path: str = "conf/config.json") -> dict:
         "ALLOW_TF32": 1,
         "BEAM": 2,
         "JIT": 1,
-        "USE_SWIGLU": 0,
+        "USE_SWIGLU": 1,
         "USE_ROPE": 1,
         "PAD_VOCAB_MULTIPLE": 128,
         "SEQUENCE_LENGTH": 256,
@@ -330,7 +330,7 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
 
     # 3. SwiGLU Activation Fusion Phase
     print("\n🔍 === Phase 3: SwiGLU Activation Fusion Evaluation ===")
-    for swiglu_val in [1, 0]:
+    for swiglu_val in [1]:
         current_config["USE_SWIGLU"] = swiglu_val
         os.makedirs("conf", exist_ok=True)
         with open("conf/config.json", "w") as f:

@@ -59,12 +59,10 @@ tiny_train/
 ├── src/                      # Source code modules
 │   ├── __init__.py
 │   ├── model.py              # Transformer model architecture
-│   ├── train.py              # Standalone benchmark trainer
 │   ├── train_production.py   # Production training engine
 │   ├── harness.py            # Optimization suite & execution wrapper
 │   ├── optimize.py           # Automated transient optimization loop with TUI
-│   ├── retokenize.py         # Dataset tokenization script
-│   └── main.py               # Entrypoint script
+│   └── retokenize.py         # Dataset tokenization script
 ├── checkpoints/              # Checkpoint output directory
 ├── data/                     # Training datasets
 ├── lint.sh                   # Linter & formatter verification script
@@ -88,11 +86,11 @@ uv sync
 ./lint.sh
 ```
 
-### 2. Standalone Benchmark Test (`src/train.py`)
+### 2. Main Production Trainer (`src/train_production.py`)
 
-Run `src/train.py` to quickly benchmark step time, GFLOPS, and MFU % over benchmark steps:
+Run `src/train_production.py` to train the 125M (or 15M) parameter Transformer model:
 ```bash
-python src/train.py
+uv run python src/train_production.py --model-size 125M
 ```
 
 ### 3. Stage 1: Harness Optimization Suite (`src/harness.py`)

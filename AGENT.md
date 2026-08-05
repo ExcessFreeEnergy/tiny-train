@@ -41,7 +41,7 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 - Halves VRAM transfer byte volume and lowers the compute-bound threshold, unlocking Ada Lovelace Tensor Cores.
 
 ### Phase 2: Micro-Batch Saturation (OOM-Safe Sweep)
-- Keep `BEAM=0`. Run the OOM-safe micro-batch sweep in `src/harness.py` (`python src/harness.py --sweep-batch`).
+- Keep `BEAM=0`. Run the OOM-safe micro-batch sweep in `src/harness.py` (`uv run python src/harness.py --sweep-batch`).
 - Doubly sweep `MICRO_BATCH_SIZE` (16 $\rightarrow$ 32 $\rightarrow$ 64 $\rightarrow$ 128 $\rightarrow$ 256...) while setting `GRAD_ACCUMULATION_STEPS = max(1, 256 // MICRO_BATCH_SIZE)` to keep effective batch size constant.
 - Stop when throughput (`samples/sec`) gain is < 5% or OOM occurs. Lock in this winning micro-batch size.
 
@@ -62,13 +62,14 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 ### B. Fused Rotary Position Embeddings (RoPE)
 - **Rule 3:** ALWAYS use Fused RoPE directly inside `CausalSelfAttention` (`apply_rope(q)` and `apply_rope(k)`), eliminating standalone position embedding VRAM reads/writes.
 
-### C. Zero Intermediate Flushes & Tight @TinyJit Scoping
+### C. Zero Intermediate Flushes & Split @TinyJit Scoping
 - **Rule 4:** NEVER call `.realize()`, `.item()`, or `.numpy()` inside `model.forward()`.
-- **Rule 5:** Defer `.item()` loss evaluation in `src/train.py` ONLY to designated logging steps.
-- **Rule 6:** ALWAYS scope `@TinyJit` cleanly and enable `TINYCACHE=1` for instant disk-cached re-runs.
+- **Rule 5:** Defer `.item()` loss evaluation in `src/train_production.py` ONLY to designated logging steps.
+- **Rule 6:** ALWAYS split `@TinyJit` into `accum_step` (micro-batch forward/backward pass) and `opt_step` (optimizer step + in-place gradient zeroing via `.assign()`).
+- **Rule 7:** Pre-allocate `.grad` zero tensors for all parameters after weight realization, and pass `.contiguous().realize()` micro-batch slices to guarantee static JIT input tensor metadata.
 
 ### D. Code Quality & Linter Compliance
-- **Rule 7:** Code MUST pass `./lint.sh` (`uv run ruff check --fix .` and `uv run ruff format .`) with zero errors or warnings before committing.
+- **Rule 8:** Code MUST pass `./lint.sh` (`uv run ruff check --fix .` and `uv run ruff format .`) with zero errors or warnings before committing.
 
 ---
 
@@ -87,10 +88,10 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 ## 6. Execution Commands
 
 ```bash
-#- **2-Stage Architecture**:
-  1. **Stage 1 (Harness Suite)**: `python src/harness.py --run-suite` executes the transient 3-phase optimization suite:
-     - **Phase 1 (Batch Optimization)**: OOM-Safe Micro-Batch Sweep discovering optimal hardware saturation.
-     - **Phase 2 (BEAM Compiler Search)**: Iteratively tests `BEAM=0` $\rightarrow$ `BEAM=2` $\rightarrow$ `BEAM=4` $\rightarrow$ `BEAM=8`, saving compiled CUDA/PTX binaries to `~/.cache/tinygrad/cache.db` (`TINYCACHE=1`).
-     - **Phase 3 (SwiGLU Activation Fusion)**: Tests SwiGLU gated activation fusion (`USE_SWIGLU=1`) for maximum arithmetic intensity.
-  2. **Stage 2 (Main Production Trainer)**: `python src/train_production.py --model-size 125M` loads `conf/best_config.json`, streaming dataset tokens via `np.memmap`, applying Cosine LR schedule with Warmup, evaluating validation loss, and saving `.safetensors` checkpoints.
+# 2-Stage Architecture:
+# 1. Stage 1 (Harness Suite): Executes the transient 3-phase optimization suite:
+uv run python src/harness.py --run-suite
+
+# 2. Stage 2 (Main Production Trainer): Loads conf/best_config.json, streaming dataset tokens via np.memmap, applying Cosine LR schedule with Warmup, evaluating validation loss, and saving .safetensors checkpoints:
+uv run python src/train_production.py --model-size 125M
 ```
