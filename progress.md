@@ -56,27 +56,29 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 }
 ```
 
----
-
-## ⚡ Gigatoken Dataset Tokenization & Preprocessing Optimizations
-
-The preprocessing pipeline integrates `gigatoken` (`src/retokenize.py`), achieving ~1000× faster encoding throughput than HuggingFace tokenizers (up to GB/s processing speeds):
-
-1. **Custom SIMD Pretokenization**: Replaces traditional Regex-based pretokenization engines with custom SIMD implementations (AVX-512 / AVX2 / NEON) to eliminate branch mispredictions and maximize CPU byte processing.
-2. **Pretoken Cache Hierarchy**: Highly optimized, multi-tiered cache hierarchy for pretoken mappings, efficiently handling long-tailed word-to-token distributions.
-3. **Direct Rust Native Streaming**: Bypasses CPython ABI/GIL overhead using native file sources (`TextFileSource`, `JsonlFileSource`, `ParquetFileSource`) to read and tokenize directly in Rust.
-4. **Thread Isolation & Memory Allocation Minimization**: Minimizes inter-thread communication bottlenecks and avoids unnecessary heap allocations during file encoding.
-5. **Vocabulary Trimming Integration (`--trim-vocab`)**: Detects and removes unused ("dead") tokens from the vocabulary, shrinking the embedding weight matrix (`wte`) in memory and accelerating downstream Transformer compute.
 
 ---
 
-## 🛠️ Summary of Code Review Fixes (`tinygrad` Speedup)
+## 💡 Key Performance Optimizations & Code Fixes
 
-1. **Fixed LM Head FP32 Cast**:
-   - Removing `.cast(dtypes.float)` from the LM head (`logits = x @ self.wte.T`) enabled `bfloat16` Tensor Core execution for the largest MatMul in the network, boosting GEMM throughput to **59,167 GFLOPS**.
+1. **LM Head Precision Fix & MatMul Acceleration**:
+   Removed `.cast(dtypes.float)` from the LM head (`logits = x @ self.wte.T`), enabling native `bfloat16` Tensor Core execution for the largest matrix multiplication in the network and boosting GEMM throughput to **59,167 GFLOPS**.
+
 2. **Precomputed Static RoPE Cache Buffers**:
-   - Replaced dynamic `Tensor.arange()` calls inside `apply_rope()` with static precomputed `cos` and `sin` buffers in `GPT.__init__`.
-3. **Corealized Parameter Updates**:
-   - Adding `Tensor.realize(loss, *params)` inside `raw_step()` guaranteed weight updates (`p.assign(...)`) were compiled and realized within the `@TinyJit` graph.
-4. **Harness Real-Time Streaming & Timeout Guard**:
-   - Streams every execution line in real-time to stdout with live status heartbeats and a strict 5-minute timeout guard (`timeout_sec=300`).
+   Static Rotary Position Embedding (RoPE) `cos` and `sin` tables are pre-cast to `dtypes.default_float` during initialization in `GPT.__init__`. Replaces dynamic `Tensor.arange()` calls inside `apply_rope()` and eliminates hundreds of runtime `.cast()` operations from the JIT graph.
+
+3. **Split JIT Gradient Accumulation & In-Place Zeroing**:
+   Separates gradient accumulation into a micro-batch pass (`accum_step`) and optimizer update (`opt_step`), executing accumulation in Python. Pre-allocates `.grad` zero tensors and uses `.assign()` for in-place zeroing to preserve static `TinyJit` buffer references without graph unrolling bloat or driver timeouts.
+
+4. **Static Input & Corealized Parameter Updates**:
+   Passes `.contiguous().realize()` micro-batch slice inputs to `@TinyJit` functions for static tensor shapes `(MICRO_BATCH_SIZE, SEQUENCE_LENGTH)`, and includes `Tensor.realize(loss, *params)` inside `raw_step()` to guarantee weight updates (`p.assign(...)`) are compiled and realized within the JIT graph.
+
+5. **Tensor Core 128 Alignment & SwiGLU Fusion**:
+   Pads all model dimensions (`d_model`, `d_head`, `d_ff`, `vocab_size`) to multiples of 128 for optimal hardware alignment, while SwiGLU activations boost arithmetic intensity.
+
+6. **High-Speed SIMD Tokenization & Vocabulary Trimming**:
+   Integrates Gigatoken (`src/retokenize.py`) for SIMD-accelerated pretokenization (AVX-512/AVX2/NEON) and vocabulary trimming (`--trim-vocab`), eliminating dead tokens and shrinking embedding matrix memory (`wte`).
+
+7. **Harness Real-Time Streaming & Timeout Guard**:
+   Streams harness execution lines in real-time to stdout with live status heartbeats and a strict 5-minute timeout guard (`timeout_sec=300`).
+
