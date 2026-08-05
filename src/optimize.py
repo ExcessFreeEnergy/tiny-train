@@ -201,7 +201,7 @@ def main():
             "SEQUENCE_LENGTH": 256,
             "LEARNING_RATE": 1e-3,
             "NUM_STEPS": 20,
-            "VOCAB_SIZE": 29362,
+            "VOCAB_SIZE": 13970,
             "D_MODEL": 768,
             "N_LAYERS": 12,
             "N_HEADS": 12,

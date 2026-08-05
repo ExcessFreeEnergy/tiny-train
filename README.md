@@ -4,7 +4,7 @@ High-performance, hardware-optimized Transformer model training engine built on 
 
 ## Objectives & Target Performance
 
-- **Target Model Architecture**: 125M Parameter Transformer (`d_model=768`, `n_layers=12`, `n_heads=12`, `d_ff=3072`, `vocab_size=29,440` padded).
+- **Target Model Architecture**: 125M Parameter Transformer (`d_model=768`, `n_layers=12`, `n_heads=12`, `d_ff=3072`, `vocab_size=14,080` padded).
 - **End Goal**: Complete a **1 Billion token** training run in **under 4 hours** (< 240 minutes).
 - **Target MFU**: **~35% MFU (~115.5 TFLOPS)** sustained performance on NVIDIA RTX 4090 (330 TFLOPS BF16 peak).
 

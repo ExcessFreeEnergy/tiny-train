@@ -28,7 +28,9 @@ def load_config(config_path: str = "conf/config.json") -> dict:
         "GRAD_ACCUMULATION_STEPS": 4,
         "DEFAULT_FLOAT": "BFLOAT16",
         "ALLOW_TF32": 1,
-        "BEAM": 2,
+        "BEAM": 4,
+        "TC": 1,
+        "TENSOR_CORES": 1,
         "JIT": 1,
         "USE_SWIGLU": 1,
         "USE_ROPE": 1,
@@ -36,7 +38,7 @@ def load_config(config_path: str = "conf/config.json") -> dict:
         "SEQUENCE_LENGTH": 256,
         "LEARNING_RATE": 1e-3,
         "NUM_STEPS": 20,
-        "VOCAB_SIZE": 29362,
+        "VOCAB_SIZE": 13970,
         "D_MODEL": 768,
         "N_LAYERS": 12,
         "N_HEADS": 12,
@@ -129,7 +131,9 @@ def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, 
     env["TINYCACHE"] = "1"
     # Prevents buffer overflows on 700+ kernel queues
     env["HCQ"] = "1"
-    env["BEAM"] = str(config.get("BEAM", 2))
+    env["BEAM"] = str(config.get("BEAM", 4))
+    env["TC"] = str(config.get("TC", 1))
+    env["TENSOR_CORES"] = str(config.get("TENSOR_CORES", 1))
     if beam_dev_timeout is not None:
         env["BEAM_DEV_TIMEOUT"] = str(beam_dev_timeout)
     else:

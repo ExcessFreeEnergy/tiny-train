@@ -82,3 +82,6 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 7. **Harness Real-Time Streaming & Timeout Guard**:
    Streams harness execution lines in real-time to stdout with live status heartbeats and a strict 5-minute timeout guard (`timeout_sec=300`).
 
+8. **BEAM Compiler Group Reduction & Tensor Core Tile Re-Alignment**:
+   Pads vocabulary size to 14,080 ($110 \times 128$), factoring cleanly into standard CUDA warp (32) and block (128, 256) boundaries. Setting `BEAM=4` with `BEAM_DEV_TIMEOUT=0` during offline compiler sweeps forces tinygrad to test `OptOps.GROUP` warp shuffle (`__shfl_xor_sync`) actions, transforming strided VRAM reads into coalesced row-wise reads (boosting bandwidth from ~5 GB/s to > 400 GB/s and dropping reduction kernel time from ~22 ms to < 1.5 ms) while `TC=1` grid alignment lifts LM Head GEMM compute throughput above 100 TFLOPS.
+

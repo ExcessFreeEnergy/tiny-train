@@ -115,7 +115,7 @@ class GPT:
 
     def __init__(
         self,
-        vocab_size: int = 29362,
+        vocab_size: int = 13970,
         d_model: int = 288,
         n_layers: int = 6,
         n_heads: int = 6,
@@ -163,7 +163,7 @@ class GPT:
 
 
 if __name__ == "__main__":
-    m15 = GPT(vocab_size=29362, d_model=288, n_layers=6, n_heads=6, d_ff=1152)
-    m125 = GPT(vocab_size=29362, d_model=768, n_layers=12, n_heads=12, d_ff=3072)
+    m15 = GPT(vocab_size=13970, d_model=288, n_layers=6, n_heads=6, d_ff=1152)
+    m125 = GPT(vocab_size=13970, d_model=768, n_layers=12, n_heads=12, d_ff=3072)
     print(f"15M Prototype Params: {m15.num_params():,} (Padded Vocab: {m15.vocab_size})")
     print(f"125M Target Params: {m125.num_params():,} (Padded Vocab: {m125.vocab_size})")

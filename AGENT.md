@@ -57,7 +57,7 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 
 ### A. Tensor Core 64/128 Divisibility Alignment
 - **Rule 1:** All matrix dimensions (`d_model`, `d_head`, `d_ff`, `vocab_size`) MUST be multiples of 64 or 128 (e.g. 128). Unaligned dimensions force Ada Lovelace Tensor Cores into zero-padded fallback routines.
-- **Rule 2:** Automatically pad `vocab_size` to a multiple of 128 (e.g. 29,362 $\rightarrow$ 29,440).
+- **Rule 2:** Automatically pad `vocab_size` to a multiple of 128 (e.g. 13,970 $\rightarrow$ 14,080).
 
 ### B. Fused Rotary Position Embeddings (RoPE)
 - **Rule 3:** ALWAYS use Fused RoPE directly inside `CausalSelfAttention` (`apply_rope(q)` and `apply_rope(k)`), eliminating standalone position embedding VRAM reads/writes.
@@ -81,7 +81,7 @@ When instructed to optimize training throughput and overcome memory bandwidth st
 | **`N_LAYERS`** | 6 | **12** | - |
 | **`N_HEADS`** | 6 | **12** | $d_{head} = 64$ (Divisible by 64) |
 | **`D_FF`** | 1152 | **3072** | Divisible by 128 |
-| **`VOCAB_SIZE`** | 29,362 | **29,440** (padded) | Divisible by 128 |
+| **`VOCAB_SIZE`** | 13,970 | **14,080** (padded) | Divisible by 128 |
 
 ---
 

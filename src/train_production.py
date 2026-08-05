@@ -88,13 +88,13 @@ def main():
 
     # Model Presets
     if args.model_size == "125M":
-        vocab_size = int(config.get("VOCAB_SIZE", 29362))
+        vocab_size = int(config.get("VOCAB_SIZE", 13970))
         d_model = 768
         n_layers = 12
         n_heads = 12
         d_ff = 3072
     else:
-        vocab_size = int(config.get("VOCAB_SIZE", 29362))
+        vocab_size = int(config.get("VOCAB_SIZE", 13970))
         d_model = int(config.get("D_MODEL", 288))
         n_layers = int(config.get("N_LAYERS", 6))
         n_heads = int(config.get("N_HEADS", 6))

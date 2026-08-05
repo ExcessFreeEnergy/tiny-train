@@ -151,6 +151,7 @@ def build_trimmed_vocab_map(
     flat_tokens: np.ndarray,
     orig_vocab_size: int,
     always_keep_ids: list[int] | None = None,
+    min_count: int = 1,
 ) -> tuple[np.ndarray, dict[int, int]]:
     """Build a trimmed vocabulary mapping from a 1D array of token IDs.
 
@@ -162,7 +163,7 @@ def build_trimmed_vocab_map(
     actual_vocab_size = max(orig_vocab_size, max_token_id + 1)
 
     counts = np.bincount(flat_tokens, minlength=actual_vocab_size)
-    used_mask = counts > 0
+    used_mask = counts >= min_count
 
     if always_keep_ids:
         for k_id in always_keep_ids:
@@ -179,12 +180,13 @@ def remap_tokens_to_trimmed(
     orig_to_new: dict[int, int],
     orig_vocab_size: int,
     target_dtype: np.dtype,
+    fallback_new_id: int = 0,
 ) -> np.ndarray:
     """Remap tokens from original token IDs to trimmed token IDs using a numpy lookup table."""
     max_token_id = int(flat_tokens.max()) if len(flat_tokens) > 0 else 0
     lut_size = max(orig_vocab_size, max_token_id + 1)
 
-    lut = np.zeros(lut_size, dtype=target_dtype)
+    lut = np.full(lut_size, fallback_new_id, dtype=target_dtype)
     for orig_id, new_id in orig_to_new.items():
         if orig_id < lut_size:
             lut[orig_id] = new_id
@@ -192,13 +194,20 @@ def remap_tokens_to_trimmed(
     return lut[flat_tokens]
 
 
-def save_vocab_map(filepath: str, orig_to_new: dict[int, int], new_to_orig: np.ndarray, orig_vocab_size: int):
+def save_vocab_map(
+    filepath: str,
+    orig_to_new: dict[int, int],
+    new_to_orig: np.ndarray,
+    orig_vocab_size: int,
+    min_count: int = 1,
+):
     """Save vocabulary mapping metadata to JSON file."""
     data = {
         "original_vocab_size": orig_vocab_size,
         "trimmed_vocab_size": len(new_to_orig),
         "dead_tokens_removed": orig_vocab_size - len(new_to_orig),
         "reduction_percentage": round((1.0 - len(new_to_orig) / orig_vocab_size) * 100.0, 2),
+        "min_count_threshold": min_count,
         "new_to_orig": [int(x) for x in new_to_orig],
         "orig_to_new": {str(k): int(v) for k, v in orig_to_new.items()},
     }
@@ -281,6 +290,12 @@ def main():
         action="store_true",
         default=False,
         help="Perform vocabulary trimming to eliminate dead tokens",
+    )
+    parser.add_argument(
+        "--min-count",
+        type=int,
+        default=50,
+        help="Minimum token occurrence frequency required in dataset to retain token in trimmed vocabulary (default: 50)",
     )
     parser.add_argument(
         "--vocab-map-out",
@@ -425,30 +440,34 @@ def main():
         print(f"Applying existing vocabulary map from '{args.vocab_map_in}'...")
         vocab_meta, orig_to_new, new_to_orig = load_vocab_map(args.vocab_map_in)
         final_vocab_size = len(new_to_orig)
-        flat_arr = remap_tokens_to_trimmed(flat_arr, orig_to_new, vocab_size, np.uint32)
+        fallback_new_id = orig_to_new.get(eos_id, 0) if eos_id is not None else 0
+        flat_arr = remap_tokens_to_trimmed(flat_arr, orig_to_new, vocab_size, np.uint32, fallback_new_id=fallback_new_id)
         print(f"  - Trimmed Vocab Size: {final_vocab_size:,} (Original: {vocab_size:,})")
 
     elif args.trim_vocab:
-        print("Performing vocabulary trimming...")
+        print(f"Performing vocabulary trimming (min_count={args.min_count})...")
         t_trim_start = time.time()
         new_to_orig, orig_to_new = build_trimmed_vocab_map(
             flat_arr,
             orig_vocab_size=vocab_size,
             always_keep_ids=[eos_id] if eos_id is not None else None,
+            min_count=args.min_count,
         )
         final_vocab_size = len(new_to_orig)
         dead_tokens = vocab_size - final_vocab_size
         reduction_pct = (dead_tokens / vocab_size) * 100.0
-        flat_arr = remap_tokens_to_trimmed(flat_arr, orig_to_new, vocab_size, np.uint32)
+        fallback_new_id = orig_to_new.get(eos_id, 0) if eos_id is not None else 0
+        flat_arr = remap_tokens_to_trimmed(flat_arr, orig_to_new, vocab_size, np.uint32, fallback_new_id=fallback_new_id)
         t_trim_end = time.time()
         print(f"Vocabulary Trimming Summary (in {t_trim_end - t_trim_start:.3f}s):")
         print(f"  - Original Vocab Size: {vocab_size:,}")
         print(f"  - Active (Used) Tokens: {final_vocab_size:,}")
-        print(f"  - Dead Tokens Removed: {dead_tokens:,} ({reduction_pct:.2f}%)")
+        print(f"  - Min Count Threshold: {args.min_count}")
+        print(f"  - Dead/Rare Tokens Removed: {dead_tokens:,} ({reduction_pct:.2f}%)")
         print(f"  - Embedding Matrix Size: ({final_vocab_size:,}, d_model)")
 
         map_out_path = args.vocab_map_out or os.path.join(os.path.dirname(os.path.abspath(args.output)), "vocab_map.json")
-        save_vocab_map(map_out_path, orig_to_new, new_to_orig, orig_vocab_size=vocab_size)
+        save_vocab_map(map_out_path, orig_to_new, new_to_orig, orig_vocab_size=vocab_size, min_count=args.min_count)
 
     # Target dtype
     if args.dtype == "uint16" or (args.dtype == "auto" and final_vocab_size <= 65535):
