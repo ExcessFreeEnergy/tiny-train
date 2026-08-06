@@ -160,11 +160,14 @@ def main():
     sys.stderr.write("[train_production.py] Realizing model weights into VRAM...\n")
     Tensor.realize(*params)
 
-    # Pre-allocate gradient buffers as zeros
+    # Pre-allocate gradient accumulation buffers as zeros and sever graph
     for p in params:
-        p.grad = Tensor.zeros(*p.shape, dtype=p.dtype, device=p.device).realize()
+        p.accum_grad = Tensor.zeros_like(p).realize()
+        p.grad = None
 
     optimizer = AdamW(params, lr=max_lr)
+    lr_tensor = Tensor([max_lr], dtype=dtypes.float, device=params[0].device).realize()
+    optimizer.lr = lr_tensor
 
     flops_per_step = 6.0 * param_count * eff_batch_size * seq_len
 
@@ -174,56 +177,47 @@ def main():
         chunk = data_source[offset : offset + eff_batch_size * seq_len + 1].astype(np.int32)
         x_np = chunk[:-1].reshape(eff_batch_size, seq_len)
         y_np = chunk[1:].reshape(eff_batch_size, seq_len)
-        return Tensor(x_np).realize(), Tensor(y_np).realize()
+        return x_np, y_np
 
-    CHUNK_SIZE = micro_batch_size
+    # Pre-allocate static micro-batch input buffers to prevent JIT memory thrashing
+    x_jit = Tensor.zeros(micro_batch_size, seq_len, dtype=dtypes.int32, device=params[0].device).realize()
+    y_jit = Tensor.zeros(micro_batch_size, seq_len, dtype=dtypes.int32, device=params[0].device).realize()
 
     def accum_step(x_micro: Tensor, y_micro: Tensor) -> Tensor:
-        total_loss = Tensor.zeros(1, dtype=dtypes.float, device=x_micro.device)
-        num_chunks = max(1, x_micro.shape[0] // CHUNK_SIZE)
-
-        for c in range(num_chunks):
-            x_chunk = x_micro[c * CHUNK_SIZE : (c + 1) * CHUNK_SIZE]
-            y_chunk = y_micro[c * CHUNK_SIZE : (c + 1) * CHUNK_SIZE]
-
-            # 1. Forward pass for full microbatch
-            logits_chunk = model.forward(x_chunk)
-            flat_logits = logits_chunk.reshape(-1, logits_chunk.shape[-1])
-            flat_y = y_chunk.flatten()
-
-            # 2. Compute chunk loss
-            chunk_loss = flat_logits.sparse_categorical_crossentropy(flat_y) / (grad_accum_steps * num_chunks)
-            scaled_loss = chunk_loss * loss_scale
-
-            # 3. Backward pass accumulates gradients directly into p.grad
-            scaled_loss.backward()
-
-            # 4. Realize gradients and chunk loss per iteration to break AST graph explosion
-            c_loss = chunk_loss.detach()
-            grads = [p.grad for p in params if p.grad is not None]
-            Tensor.realize(c_loss, *grads)
-            total_loss += c_loss
-
-        return total_loss
+        logits_chunk = model.forward(x_micro)
+        flat_logits = logits_chunk.reshape(-1, logits_chunk.shape[-1])
+        flat_y = y_micro.flatten()
+        chunk_loss = flat_logits.sparse_categorical_crossentropy(flat_y) / grad_accum_steps
+        scaled_loss = chunk_loss * loss_scale
+        scaled_loss.backward()
+        for p in params:
+            if p.grad is not None:
+                # Statically accumulate and sever the graph
+                p.accum_grad.assign(p.accum_grad + p.grad)
+                p.grad = None  # Force backward() to create a fresh leaf node next iteration
+        return chunk_loss
 
     def opt_step():
+        for p in params:
+            p.grad = p.accum_grad
         Tensor.realize(*optimizer.schedule_step())
         for p in params:
-            p.grad.assign(Tensor.zeros(*p.shape, dtype=p.dtype, device=p.device)).realize()
+            p.accum_grad.assign(Tensor.zeros_like(p))
+            p.grad = None
 
-    # 1. Fetch a single initialization batch
+    # 1. Fetch initialization batch
     init_x, init_y = get_batch(train_data, 0)
 
-    # 2. Run ONE uncompiled step to force AdamW to allocate momentum buffers
+    # 2. Run ONE uncompiled step to force AdamW to allocate momentum buffers (m and v) in VRAM before JIT
     sys.stderr.write("[train_production.py] Initializing optimizer states before JIT...\n")
     for i in range(grad_accum_steps):
-        x_m = init_x[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
-        y_m = init_y[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
-        accum_step(x_m, y_m)
+        x_jit.assign(init_x[i * micro_batch_size : (i + 1) * micro_batch_size])
+        y_jit.assign(init_y[i * micro_batch_size : (i + 1) * micro_batch_size])
+        accum_step(x_jit, y_jit)
     opt_step()
     Device[Device.DEFAULT].synchronize()
 
-    # 3. NOW it is safe to lock the graph and wrap in TinyJit
+    # 3. NOW it is safe to wrap in TinyJit
     if use_jit:
         accum_fn = TinyJit(accum_step)
         opt_fn = TinyJit(opt_step)
@@ -231,15 +225,15 @@ def main():
         accum_fn = accum_step
         opt_fn = opt_step
 
-    # 4. Proceed with JIT warmup to trigger the actual kernel compilation
+    # 4. Proceed with JIT warmup to trigger actual kernel compilation
     sys.stderr.write("[train_production.py] Running JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
         xw, yw = get_batch(train_data, 100 + w)
         for i in range(grad_accum_steps):
-            x_m = xw[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
-            y_m = yw[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
-            _ = accum_fn(x_m, y_m)
+            x_jit.assign(xw[i * micro_batch_size : (i + 1) * micro_batch_size])
+            y_jit.assign(yw[i * micro_batch_size : (i + 1) * micro_batch_size])
+            _ = accum_fn(x_jit, y_jit)
         opt_fn()
         Device[Device.DEFAULT].synchronize()
 
@@ -253,38 +247,39 @@ def main():
     # Production Training Loop
     for step in range(1, args.total_steps + 1):
         cur_lr = get_lr_schedule(step, args.total_steps, warmup_iters, max_lr, min_lr)
-        optimizer.lr = cur_lr
+        lr_tensor.assign([cur_lr]).realize()
 
         x_b, y_b = get_batch(train_data, step)
 
         t0 = time.time()
-        micro_losses = []
+        step_loss_tensor = Tensor([0.0], device=params[0].device)
         for i in range(grad_accum_steps):
-            x_micro = x_b[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
-            y_micro = y_b[i * micro_batch_size : (i + 1) * micro_batch_size].contiguous().realize()
-            mloss = accum_fn(x_micro, y_micro)
-            micro_losses.append(mloss)
+            x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+            y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+            loss_micro = accum_fn(x_jit, y_jit)
+            step_loss_tensor = step_loss_tensor + loss_micro
+
         opt_fn()
         Device[Device.DEFAULT].synchronize()
+        step_loss = float(step_loss_tensor.cast(dtypes.float).item())
         t1 = time.time()
 
         step_ms = (t1 - t0) * 1000.0
         step_times.append(step_ms)
 
         total_steps = args.total_steps
-        if step == 1 or step == total_steps or step % 1000 == 0:
-            loss = sum(micro_losses).squeeze()
+        if step == 1 or step == total_steps or step % 1000 == 0 or step % args.eval_interval == 0:
+            last_loss_val = step_loss
             tokens_per_sec = (eff_batch_size * seq_len) / (step_ms / 1000.0) if step_ms > 0 else 0.0
-            last_loss_val = float(loss.numpy())
 
-            if not disable_debug:
-                print(f"Step {step:6d} / {total_steps} | Loss: {loss.numpy():.4f} | Tok/sec: {tokens_per_sec:.0f}")
+            if not disable_debug and (step == 1 or step == total_steps or step % 1000 == 0):
+                print(f"Step {step:6d} / {total_steps} | Loss: {last_loss_val:.4f} | Tok/sec: {tokens_per_sec:.0f}")
 
         # Checkpointing & Validation Eval
         if step % args.eval_interval == 0 or step == args.total_steps:
             x_v, y_v = get_batch(valid_data, step + 999)
-            val_logits = model.forward(x_v[:micro_batch_size])
-            val_loss_tensor = val_logits.sparse_categorical_crossentropy(y_v[:micro_batch_size]).realize()
+            val_logits = model.forward(Tensor(x_v[:micro_batch_size]))
+            val_loss_tensor = val_logits.sparse_categorical_crossentropy(Tensor(y_v[:micro_batch_size])).realize()
             val_loss = float(val_loss_tensor.cast(dtypes.float).item())
             print(f"📊 Validation Loss at step {step}: {val_loss:.4f}")
 
