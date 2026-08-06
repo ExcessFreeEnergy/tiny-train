@@ -294,7 +294,13 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
     return best_batch
 
 
-def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeout_sec: int = 3600, beam_dev_timeout: int | None = None) -> dict:
+def run_transient_suite(
+    base_config: dict,
+    skip_batch_sweep: bool = False,
+    timeout_sec: int = 3600,
+    beam_dev_timeout: int | None = None,
+    max_beam: int | None = None,
+) -> dict:
     """Run Transient Harness Suite: Batch Optimization -> BEAM Search -> SwiGLU Fusion."""
     print("\n=======================================================")
     print("🚀 STARTING TRANSIENT HARNESS OPTIMIZATION SUITE")
@@ -319,8 +325,7 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
         current_config["MICRO_BATCH_SIZE"] = winning_batch
         current_config["GRAD_ACCUMULATION_STEPS"] = max(1, 256 // winning_batch)
 
-    # 2. BEAM Compiler Search Phase (BEAM=0 -> 1 -> 2 -> 4)
-    print("\n🔍 === Phase 2: BEAM Compiler Search Sweep (BEAM=0 -> 1 -> 2 -> 4) ===")
+    # 2. BEAM Compiler Search Phase
     best_beam = 0
     best_step_time = 99999.0
 
@@ -333,6 +338,14 @@ def run_transient_suite(base_config: dict, skip_batch_sweep: bool = False, timeo
                 beam_candidates.sort()
         except ValueError:
             pass
+
+    if max_beam is not None:
+        beam_candidates = [b for b in beam_candidates if b <= max_beam]
+        if not beam_candidates:
+            beam_candidates = [0]
+
+    beam_str = " -> ".join(map(str, beam_candidates))
+    print(f"\n🔍 === Phase 2: BEAM Compiler Search Sweep (BEAM={beam_str}) ===")
 
     for beam_val in beam_candidates:
         print(f"\n[BEAM SWEEP] Evaluating BEAM={beam_val}...")
@@ -402,13 +415,33 @@ def main():
         "--disable-beam-timeout", "--no-beam-timeout", action="store_true", default=False, help="Disable BEAM compiler dev timeout (sets BEAM_DEV_TIMEOUT=0)"
     )
     parser.add_argument("--beam-dev-timeout", type=int, default=None, help="BEAM compiler dev timeout in seconds (default: 60, set to 0 to disable)")
+    parser.add_argument(
+        "--max-beam",
+        "--max-beam-level",
+        type=int,
+        default=None,
+        help="Maximum BEAM compiler level to evaluate during BEAM search sweep (e.g., 1)",
+    )
     args = parser.parse_args()
 
     beam_timeout = 0 if args.disable_beam_timeout else args.beam_dev_timeout
 
+    max_beam = args.max_beam
+    if max_beam is None and "MAX_BEAM" in os.environ:
+        try:
+            max_beam = int(os.environ["MAX_BEAM"])
+        except ValueError:
+            pass
+
     cfg = load_config()
     if args.run_suite:
-        run_transient_suite(cfg, skip_batch_sweep=args.skip_batch_sweep, timeout_sec=args.timeout, beam_dev_timeout=beam_timeout)
+        run_transient_suite(
+            cfg,
+            skip_batch_sweep=args.skip_batch_sweep,
+            timeout_sec=args.timeout,
+            beam_dev_timeout=beam_timeout,
+            max_beam=max_beam,
+        )
     elif args.sweep_batch:
         find_optimal_batch_size(cfg, beam_dev_timeout=beam_timeout)
     else:
