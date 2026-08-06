@@ -1,9 +1,19 @@
 {
-  "step_time_ms": 99999.0,
-  "final_loss": 999.0,
-  "peak_gflops": 0.0,
-  "mfu_pct": 0.0,
-  "nan_detected": true,
-  "oom_detected": true,
-  "status": "TIMED_OUT"
+  "step_time_ms": 406.391,
+  "peak_gflops": 30457.9,
+  "mfu_pct": 9.23,
+  "avg_bandwidth_gbps": 3997.1,
+  "final_loss": 5.5625,
+  "nan_detected": false,
+  "jit_active": true,
+  "micro_batch_size": 16,
+  "grad_accumulation_steps": 4,
+  "effective_batch_size": 64,
+  "padded_vocab_size": 16384,
+  "total_kernels": 3775,
+  "mem_bound_kernels": 1878,
+  "memory_bound_kernel_pct": 49.7,
+  "arithmetic_intensity": 4.75,
+  "status": "MEMORY_BOUND",
+  "oom_detected": false
 }

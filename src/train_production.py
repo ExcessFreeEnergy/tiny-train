@@ -63,7 +63,13 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500, help="Total training steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-interval", type=int, default=50, help="Steps between validation evaluations")
+    parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
+    parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
     args = parser.parse_args()
+
+    disable_debug = args.disable_debug or args.debug_level == 0 or os.environ.get("DEBUG") == "0"
+    if disable_debug:
+        os.environ["DEBUG"] = "0"
 
     config = load_best_config()
 
@@ -170,7 +176,7 @@ def main():
         y_np = chunk[1:].reshape(eff_batch_size, seq_len)
         return Tensor(x_np).realize(), Tensor(y_np).realize()
 
-    CHUNK_SIZE = min(4, micro_batch_size)
+    CHUNK_SIZE = micro_batch_size
 
     def accum_step(x_micro: Tensor, y_micro: Tensor) -> Tensor:
         total_loss = Tensor.zeros(1, dtype=dtypes.float, device=x_micro.device)
@@ -180,7 +186,7 @@ def main():
             x_chunk = x_micro[c * CHUNK_SIZE : (c + 1) * CHUNK_SIZE]
             y_chunk = y_micro[c * CHUNK_SIZE : (c + 1) * CHUNK_SIZE]
 
-            # 1. Forward pass for 1,024 tokens -> 28.8 MB logits (Fits in 48MB L2)
+            # 1. Forward pass for full microbatch
             logits_chunk = model.forward(x_chunk)
             flat_logits = logits_chunk.reshape(-1, logits_chunk.shape[-1])
             flat_y = y_chunk.flatten()
@@ -265,17 +271,14 @@ def main():
         step_ms = (t1 - t0) * 1000.0
         step_times.append(step_ms)
 
-        if step == 1 or step == args.total_steps or step % 10 == 0:
-            loss_val = float(sum(ml.cast(dtypes.float).item() for ml in micro_losses))
-            last_loss_val = loss_val
-            throughput = (eff_batch_size / (step_ms / 1000.0)) if step_ms > 0 else 0.0
-            gflops = (flops_per_step / (step_ms / 1000.0)) / 1e9 if step_ms > 0 else 0.0
-            mfu_pct = (gflops / 330000.0) * 100.0
+        total_steps = args.total_steps
+        if step == 1 or step == total_steps or step % 1000 == 0:
+            loss = sum(micro_losses).squeeze()
+            tokens_per_sec = (eff_batch_size * seq_len) / (step_ms / 1000.0) if step_ms > 0 else 0.0
+            last_loss_val = float(loss.numpy())
 
-            print(
-                f"[STEP {step:04d}/{args.total_steps}] loss={loss_val:.4f} | lr={cur_lr:.2e} | "
-                f"time={step_ms:.2f}ms | tput={throughput:.1f} smp/s | GFLOPS={gflops:.1f} | MFU={mfu_pct:.2f}%"
-            )
+            if not disable_debug:
+                print(f"Step {step:6d} / {total_steps} | Loss: {loss.numpy():.4f} | Tok/sec: {tokens_per_sec:.0f}")
 
         # Checkpointing & Validation Eval
         if step % args.eval_interval == 0 or step == args.total_steps:

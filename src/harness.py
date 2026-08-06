@@ -129,13 +129,25 @@ def parse_telemetry_from_output(output_text: str) -> dict:
     return base_metrics
 
 
-def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, beam_dev_timeout: int | None = None) -> dict:
+def run_harness(
+    config_path: str = "conf/config.json",
+    timeout_sec: int = 3600,
+    beam_dev_timeout: int | None = None,
+    debug_level: int | None = None,
+    disable_debug: bool = False,
+) -> dict:
     config = load_config(config_path)
     print("=== Tinygrad Training Optimization Harness ===")
     print(f"Configuration: {json.dumps(config, indent=2)}")
 
     env = os.environ.copy()
-    env["DEBUG"] = "2"
+    if disable_debug or debug_level == 0:
+        env["DEBUG"] = "0"
+    elif debug_level is not None:
+        env["DEBUG"] = str(debug_level)
+    else:
+        env["DEBUG"] = os.environ.get("DEBUG", "2")
+
     env["TINYCACHE"] = "1"
     # Prevents buffer overflows on 700+ kernel queues
     env["HCQ"] = "1"
@@ -156,6 +168,8 @@ def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, 
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_production.py")
     num_steps = str(config.get("NUM_STEPS", 10))
     cmd = [sys.executable, script_path, "--model-size", "125M", "--total-steps", num_steps]
+    if env["DEBUG"] == "0":
+        cmd.append("--disable-debug")
     print(f"\nExecuting payload: {' '.join(cmd)}")
     print(f"⏱️ Hard Timeout Limit: {timeout_sec}s ({timeout_sec // 60} minutes max per run)\n")
     t0 = time.time()
@@ -184,7 +198,7 @@ def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, 
             sys.stdout.flush()
             last_heartbeat = now
 
-        if proc.poll() is not None:
+        if not line and proc.poll() is not None:
             break
 
         if elapsed > timeout_sec:
@@ -237,7 +251,13 @@ def run_harness(config_path: str = "conf/config.json", timeout_sec: int = 3600, 
     return metrics
 
 
-def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256, beam_dev_timeout: int | None = None) -> int:
+def find_optimal_batch_size(
+    base_config: dict,
+    target_effective_batch: int = 256,
+    beam_dev_timeout: int | None = None,
+    debug_level: int | None = None,
+    disable_debug: bool = False,
+) -> int:
     """Run OOM-Safe Micro-Batch Sweep to discover optimal hardware micro-batch size."""
     print("\n🔍 === Phase 1: Micro-Batch Optimization Sweep ===")
     test_batch = 16
@@ -262,7 +282,7 @@ def find_optimal_batch_size(base_config: dict, target_effective_batch: int = 256
             json.dump(config, f, indent=2)
 
         print(f"\n[SWEEP] Testing MICRO_BATCH_SIZE={test_batch} (GRAD_ACCUM={config['GRAD_ACCUMULATION_STEPS']})...")
-        metrics = run_harness("conf/config.json", beam_dev_timeout=beam_dev_timeout)
+        metrics = run_harness("conf/config.json", beam_dev_timeout=beam_dev_timeout, debug_level=debug_level, disable_debug=disable_debug)
 
         if metrics.get("oom_detected") or metrics.get("nan_detected"):
             print(f"[OOM/Instability] Hit limit at MICRO_BATCH_SIZE={test_batch}")
@@ -300,6 +320,8 @@ def run_transient_suite(
     timeout_sec: int = 3600,
     beam_dev_timeout: int | None = None,
     max_beam: int | None = None,
+    debug_level: int | None = None,
+    disable_debug: bool = False,
 ) -> dict:
     """Run Transient Harness Suite: Batch Optimization -> BEAM Search -> SwiGLU Fusion."""
     print("\n=======================================================")
@@ -321,7 +343,7 @@ def run_transient_suite(
     if skip_batch_sweep:
         print(f"⏩ [SKIP BATCH SWEEP] Using existing batch settings: MICRO_BATCH_SIZE={current_config.get('MICRO_BATCH_SIZE', 64)}")
     else:
-        winning_batch = find_optimal_batch_size(current_config, beam_dev_timeout=beam_dev_timeout)
+        winning_batch = find_optimal_batch_size(current_config, beam_dev_timeout=beam_dev_timeout, debug_level=debug_level, disable_debug=disable_debug)
         current_config["MICRO_BATCH_SIZE"] = winning_batch
         current_config["GRAD_ACCUMULATION_STEPS"] = max(1, 256 // winning_batch)
 
@@ -355,7 +377,13 @@ def run_transient_suite(
         with open("conf/config.json", "w") as f:
             json.dump(current_config, f, indent=2)
 
-        m = run_harness("conf/config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
+        m = run_harness(
+            "conf/config.json",
+            timeout_sec=timeout_sec,
+            beam_dev_timeout=beam_dev_timeout,
+            debug_level=debug_level,
+            disable_debug=disable_debug,
+        )
         step_ms = m.get("step_time_ms", 99999.0)
         gflops = m.get("peak_gflops", 0.0)
         mfu = m.get("mfu_pct", 0.0)
@@ -378,7 +406,13 @@ def run_transient_suite(
             json.dump(current_config, f, indent=2)
 
         print(f"\n[SWIGLU EVAL] Testing USE_SWIGLU={swiglu_val}...")
-        m = run_harness("conf/config.json", timeout_sec=timeout_sec, beam_dev_timeout=beam_dev_timeout)
+        m = run_harness(
+            "conf/config.json",
+            timeout_sec=timeout_sec,
+            beam_dev_timeout=beam_dev_timeout,
+            debug_level=debug_level,
+            disable_debug=disable_debug,
+        )
         step_ms = m.get("step_time_ms", 99999.0)
         gflops = m.get("peak_gflops", 0.0)
         mfu = m.get("mfu_pct", 0.0)
@@ -422,9 +456,21 @@ def main():
         default=None,
         help="Maximum BEAM compiler level to evaluate during BEAM search sweep (e.g., 1)",
     )
+    parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable tinygrad debug output (sets DEBUG=0)")
+    parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set tinygrad DEBUG level (e.g. 0, 1, 2)")
     args = parser.parse_args()
 
     beam_timeout = 0 if args.disable_beam_timeout else args.beam_dev_timeout
+    if beam_timeout is None and "BEAM_TIMEOUT" in os.environ:
+        try:
+            beam_timeout = int(os.environ["BEAM_TIMEOUT"])
+        except ValueError:
+            pass
+    if beam_timeout is None and "BEAM_DEV_TIMEOUT" in os.environ:
+        try:
+            beam_timeout = int(os.environ["BEAM_DEV_TIMEOUT"])
+        except ValueError:
+            pass
 
     max_beam = args.max_beam
     if max_beam is None and "MAX_BEAM" in os.environ:
@@ -441,11 +487,19 @@ def main():
             timeout_sec=args.timeout,
             beam_dev_timeout=beam_timeout,
             max_beam=max_beam,
+            debug_level=args.debug_level,
+            disable_debug=args.disable_debug,
         )
     elif args.sweep_batch:
-        find_optimal_batch_size(cfg, beam_dev_timeout=beam_timeout)
+        find_optimal_batch_size(cfg, beam_dev_timeout=beam_timeout, debug_level=args.debug_level, disable_debug=args.disable_debug)
     else:
-        run_harness("conf/config.json", timeout_sec=args.timeout, beam_dev_timeout=beam_timeout)
+        run_harness(
+            "conf/config.json",
+            timeout_sec=args.timeout,
+            beam_dev_timeout=beam_timeout,
+            debug_level=args.debug_level,
+            disable_debug=args.disable_debug,
+        )
 
 
 if __name__ == "__main__":

@@ -507,7 +507,7 @@ def main():
         preview = sample_text[:200].decode("utf-8", errors="replace")
         print(f"Original Tokens (first 10): {sample_doc[:10]}")
         if orig_to_new is not None:
-            trimmed_sample = [orig_to_new[int(tok)] for tok in sample_doc[:10]]
+            trimmed_sample = [orig_to_new.get(int(tok), 0) for tok in sample_doc[:10]]
             print(f"Trimmed Tokens (first 10):  {trimmed_sample}")
             # Verify inverse mapping decodes back perfectly
             recovered = [int(new_to_orig[tok]) for tok in trimmed_sample]
