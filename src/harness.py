@@ -84,7 +84,9 @@ def parse_telemetry_from_output(output_text: str) -> dict:
                 mem_bound_kernels += 1
 
     nan_detected = "NaN/Inf detected" in output_text or "nan" in output_text.lower()
-    oom_detected = "OutOfMemory" in output_text or "CUDA error: out of memory" in output_text or "OOM" in output_text
+    oom_detected = "OutOfMemory" in output_text or "CUDA error: out of memory" in output_text or "OOM" in output_text or "NV_ERR_NO_MEMORY" in output_text
+    wait_timeout_detected = "Wait timeout" in output_text or "signal is not set to" in output_text or "timeline_signal.wait" in output_text or "TRAINER ERROR" in output_text or "weakref" in output_text
+    recursion_detected = "RecursionError" in output_text or "recursion limit" in output_text or "recursion depth" in output_text
 
     if "step_time_ms" not in base_metrics:
         step_times = [float(m) for m in re.findall(r"(?:time|step_time)=([0-9.]+)\s*ms", output_text)]
@@ -122,6 +124,8 @@ def parse_telemetry_from_output(output_text: str) -> dict:
             "status": status,
             "nan_detected": base_metrics.get("nan_detected", nan_detected),
             "oom_detected": oom_detected,
+            "wait_timeout_detected": wait_timeout_detected,
+            "recursion_detected": recursion_detected,
             "jit_active": base_metrics.get("jit_active", "Warmup complete" in output_text or "JIT Warmup complete" in output_text),
         }
     )
@@ -167,7 +171,7 @@ def run_harness(
 
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_production.py")
     num_steps = str(config.get("NUM_STEPS", 10))
-    cmd = [sys.executable, script_path, "--model-size", "125M", "--total-steps", num_steps]
+    cmd = [sys.executable, script_path, "--model-size", "125M", "--total-steps", num_steps, "--config", config_path]
     if env["DEBUG"] == "0":
         cmd.append("--disable-debug")
     print(f"\nExecuting payload: {' '.join(cmd)}")
@@ -225,18 +229,28 @@ def run_harness(
             "final_loss": 999.0,
             "peak_gflops": 0.0,
             "mfu_pct": 0.0,
-            "nan_detected": True,
-            "oom_detected": True,
+            "nan_detected": False,
+            "oom_detected": False,
+            "wait_timeout_detected": True,
+            "incompatible_config": True,
+            "error_type": "HARDWARE_TIMEOUT",
             "status": "TIMED_OUT",
         }
     else:
         print(f"✅ Subprocess completed with return code {proc.returncode} in {t1 - t0:.2f}s")
         metrics = parse_telemetry_from_output(full_output)
         if proc.returncode != 0:
-            if "OutOfMemory" in full_output or "OOM" in full_output or "NV_ERR_NO_MEMORY" in full_output:
-                metrics["oom_detected"] = True
+            metrics["incompatible_config"] = True
+            if metrics.get("oom_detected"):
+                metrics["error_type"] = "OOM"
+            elif metrics.get("wait_timeout_detected"):
+                metrics["error_type"] = "HARDWARE_WAIT_TIMEOUT"
+            elif metrics.get("recursion_detected"):
+                metrics["error_type"] = "AST_RECURSION_LIMIT"
+            elif metrics.get("nan_detected"):
+                metrics["error_type"] = "NAN_INSTABILITY"
             else:
-                metrics["nan_detected"] = True
+                metrics["error_type"] = "SUBPROCESS_FAILED"
 
     score_file = "conf/score.json"
     os.makedirs(os.path.dirname(score_file), exist_ok=True)
@@ -253,69 +267,111 @@ def run_harness(
 
 def find_optimal_batch_size(
     base_config: dict,
-    target_effective_batch: int = 256,
+    target_effective_batch: int | None = None,
+    grad_accum_candidates: list[int] | None = None,
+    max_effective_batch: int = 512,
+    full_sweep: bool = True,
     beam_dev_timeout: int | None = None,
     debug_level: int | None = None,
     disable_debug: bool = False,
-) -> int:
-    """Run OOM-Safe Micro-Batch Sweep to discover optimal hardware micro-batch size."""
-    print("\n🔍 === Phase 1: Micro-Batch Optimization Sweep ===")
-    test_batch = 16
+) -> tuple[int, int]:
+    """Run OOM-Safe Micro-Batch & Grad Accumulation Grid Sweep to discover optimal hardware settings."""
+    print("\n🔍 === Phase 1: Micro-Batch & Grad Accumulation Grid Sweep ===")
+    if grad_accum_candidates is None:
+        grad_accum_candidates = [1, 2, 4, 8, 16, 32]
+
+    micro_batch_candidates = [16, 32, 64, 128, 256]
     best_throughput = 0.0
-    best_batch = 16
+    best_batch = int(base_config.get("MICRO_BATCH_SIZE", 16))
+    best_accum = int(base_config.get("GRAD_ACCUMULATION_STEPS", 4))
+    max_failed_accum: int | None = None
 
-    while test_batch <= 256:
-        config = copy.deepcopy(base_config)
-        config["MICRO_BATCH_SIZE"] = test_batch
-        config["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // test_batch)
-        if "BEAM" in os.environ:
-            try:
-                config["BEAM"] = int(os.environ["BEAM"])
-            except ValueError:
-                config["BEAM"] = os.environ["BEAM"]
-        else:
-            config["BEAM"] = base_config.get("BEAM", 2)
-        config["NUM_STEPS"] = 3
+    for test_batch in micro_batch_candidates:
+        batch_has_valid_run = False
+        for test_accum in grad_accum_candidates:
+            if max_failed_accum is not None and test_accum >= max_failed_accum:
+                print(
+                    f"⏩ [SKIP CUTOFF] MICRO_BATCH_SIZE={test_batch}, GRAD_ACCUM={test_accum} skipped "
+                    f"(GRAD_ACCUM >= {max_failed_accum} failed at lower/equal micro-batch size)"
+                )
+                break
 
-        os.makedirs("conf", exist_ok=True)
-        with open("conf/config.json", "w") as f:
-            json.dump(config, f, indent=2)
+            eff_batch = test_batch * test_accum
+            if eff_batch > max_effective_batch and test_accum > 1:
+                continue
 
-        print(f"\n[SWEEP] Testing MICRO_BATCH_SIZE={test_batch} (GRAD_ACCUM={config['GRAD_ACCUMULATION_STEPS']})...")
-        metrics = run_harness("conf/config.json", beam_dev_timeout=beam_dev_timeout, debug_level=debug_level, disable_debug=disable_debug)
+            config = copy.deepcopy(base_config)
+            config["MICRO_BATCH_SIZE"] = test_batch
+            config["GRAD_ACCUMULATION_STEPS"] = test_accum
+            if "BEAM" in os.environ:
+                try:
+                    config["BEAM"] = int(os.environ["BEAM"])
+                except ValueError:
+                    config["BEAM"] = os.environ["BEAM"]
+            else:
+                config["BEAM"] = base_config.get("BEAM", 2)
+            config["NUM_STEPS"] = 3
 
-        if metrics.get("oom_detected") or metrics.get("nan_detected"):
-            print(f"[OOM/Instability] Hit limit at MICRO_BATCH_SIZE={test_batch}")
+            os.makedirs("conf", exist_ok=True)
+            with open("conf/config.json", "w") as f:
+                json.dump(config, f, indent=2)
+
+            print(f"\n[SWEEP] Testing MICRO_BATCH_SIZE={test_batch}, GRAD_ACCUM={test_accum} (Eff Batch={eff_batch})...")
+            metrics = run_harness(
+                "conf/config.json",
+                beam_dev_timeout=beam_dev_timeout,
+                debug_level=debug_level,
+                disable_debug=disable_debug,
+            )
+
+            if metrics.get("incompatible_config") or metrics.get("oom_detected") or metrics.get("nan_detected") or metrics.get("wait_timeout_detected"):
+                err_type = metrics.get("error_type", "INCOMPATIBLE_CONFIG")
+                if max_failed_accum is None or test_accum < max_failed_accum:
+                    max_failed_accum = test_accum
+                print(
+                    f"⚠️ [INCOMPATIBLE CONFIG] MICRO_BATCH_SIZE={test_batch}, GRAD_ACCUM={test_accum} failed ({err_type}). "
+                    f"Capping max GRAD_ACCUM < {max_failed_accum} for all larger micro-batch sizes."
+                )
+                break
+
+            batch_has_valid_run = True
+            step_time_ms = metrics.get("step_time_ms", 9999.0)
+            throughput = (eff_batch / (step_time_ms / 1000.0)) if step_time_ms > 0 else 0.0
+            ai = metrics.get("arithmetic_intensity", 0.0)
+
+            print(
+                f"[SWEEP RESULT] MB={test_batch}, GA={test_accum} (Eff={eff_batch}): {throughput:.1f} smp/s | AI: {ai:.2f} | Step Time: {step_time_ms:.2f}ms"
+            )
+
+            if throughput > best_throughput:
+                best_throughput = throughput
+                best_batch = test_batch
+                best_accum = test_accum
+
+        if not batch_has_valid_run:
+            print(f"[OOM Limit] Stopping sweep at MICRO_BATCH_SIZE={test_batch}")
             break
 
-        step_time_ms = metrics.get("step_time_ms", 9999.0)
-        eff_batch = test_batch * config["GRAD_ACCUMULATION_STEPS"]
-        throughput = (eff_batch / (step_time_ms / 1000.0)) if step_time_ms > 0 else 0.0
-        ai = metrics.get("arithmetic_intensity", 0.0)
-
-        print(f"[SWEEP RESULT] MICRO_BATCH_SIZE={test_batch}: {throughput:.1f} smp/s | AI: {ai:.2f} | Step Time: {step_time_ms:.2f}ms")
-
-        if throughput > best_throughput * 1.05:
-            best_throughput = throughput
-            best_batch = test_batch
-            test_batch *= 2
-        else:
-            print(f"[SATURATED] Throughput plateaued around MICRO_BATCH_SIZE={best_batch} (Gain < 5%)")
-            break
-
-    print(f"\n✅ Winning Micro-Batch Size Locked: MICRO_BATCH_SIZE={best_batch} ({best_throughput:.1f} smp/s)")
+    print(
+        f"\n✅ Winning Configuration Locked: MICRO_BATCH_SIZE={best_batch}, GRAD_ACCUM={best_accum} ({best_throughput:.1f} smp/s, Eff Batch={best_batch * best_accum})"
+    )
     final_cfg = copy.deepcopy(base_config)
     final_cfg["MICRO_BATCH_SIZE"] = best_batch
-    final_cfg["GRAD_ACCUMULATION_STEPS"] = max(1, target_effective_batch // best_batch)
+    final_cfg["GRAD_ACCUMULATION_STEPS"] = best_accum
     os.makedirs("conf", exist_ok=True)
     with open("conf/config.json", "w") as f:
         json.dump(final_cfg, f, indent=2)
+    with open("conf/best_config.json", "w") as f:
+        json.dump(final_cfg, f, indent=2)
 
-    return best_batch
+    return best_batch, best_accum
 
 
 def run_transient_suite(
     base_config: dict,
+    target_effective_batch: int | None = None,
+    grad_accum_candidates: list[int] | None = None,
+    full_sweep: bool = True,
     skip_batch_sweep: bool = False,
     timeout_sec: int = 3600,
     beam_dev_timeout: int | None = None,
@@ -343,9 +399,17 @@ def run_transient_suite(
     if skip_batch_sweep:
         print(f"⏩ [SKIP BATCH SWEEP] Using existing batch settings: MICRO_BATCH_SIZE={current_config.get('MICRO_BATCH_SIZE', 64)}")
     else:
-        winning_batch = find_optimal_batch_size(current_config, beam_dev_timeout=beam_dev_timeout, debug_level=debug_level, disable_debug=disable_debug)
+        winning_batch, winning_accum = find_optimal_batch_size(
+            current_config,
+            target_effective_batch=target_effective_batch,
+            grad_accum_candidates=grad_accum_candidates,
+            full_sweep=full_sweep,
+            beam_dev_timeout=beam_dev_timeout,
+            debug_level=debug_level,
+            disable_debug=disable_debug,
+        )
         current_config["MICRO_BATCH_SIZE"] = winning_batch
-        current_config["GRAD_ACCUMULATION_STEPS"] = max(1, 256 // winning_batch)
+        current_config["GRAD_ACCUMULATION_STEPS"] = winning_accum
 
     # 2. BEAM Compiler Search Phase
     best_beam = 0
@@ -444,6 +508,26 @@ def main():
     parser.add_argument("--sweep-batch", action="store_true", default=False, help="Run OOM-safe micro-batch discovery sweep")
     parser.add_argument("--run-suite", action="store_true", default=False, help="Run full transient 3-phase optimization suite")
     parser.add_argument("--skip-batch-sweep", action="store_true", default=False, help="Skip Phase 1 micro-batch sweep in suite execution")
+    parser.add_argument(
+        "--grad-accum-list",
+        type=str,
+        default="1,2,4,8,16,32",
+        help="Comma-separated list of candidate gradient accumulation steps to test (default: 1,2,4,8,16,32)",
+    )
+    parser.add_argument(
+        "--target-effective-batch",
+        "--effective-batch",
+        type=int,
+        default=None,
+        help="Target effective batch size for batch sweep (default: 256 or derived from config)",
+    )
+    parser.add_argument(
+        "--no-full-sweep",
+        dest="full_sweep",
+        action="store_false",
+        default=True,
+        help="Stop batch sweep early when throughput gain < 5%%",
+    )
     parser.add_argument("--timeout", type=int, default=3600, help="Subprocess timeout limit in seconds (default: 3600s / 60 mins)")
     parser.add_argument(
         "--disable-beam-timeout", "--no-beam-timeout", action="store_true", default=False, help="Disable BEAM compiler dev timeout (sets BEAM_DEV_TIMEOUT=0)"
@@ -479,10 +563,15 @@ def main():
         except ValueError:
             pass
 
+    grad_accum_candidates = [int(x.strip()) for x in args.grad_accum_list.split(",") if x.strip().isdigit()]
+
     cfg = load_config()
     if args.run_suite:
         run_transient_suite(
             cfg,
+            target_effective_batch=args.target_effective_batch,
+            grad_accum_candidates=grad_accum_candidates,
+            full_sweep=args.full_sweep,
             skip_batch_sweep=args.skip_batch_sweep,
             timeout_sec=args.timeout,
             beam_dev_timeout=beam_timeout,
@@ -491,7 +580,15 @@ def main():
             disable_debug=args.disable_debug,
         )
     elif args.sweep_batch:
-        find_optimal_batch_size(cfg, beam_dev_timeout=beam_timeout, debug_level=args.debug_level, disable_debug=args.disable_debug)
+        find_optimal_batch_size(
+            cfg,
+            target_effective_batch=args.target_effective_batch,
+            grad_accum_candidates=grad_accum_candidates,
+            full_sweep=args.full_sweep,
+            beam_dev_timeout=beam_timeout,
+            debug_level=args.debug_level,
+            disable_debug=args.disable_debug,
+        )
     else:
         run_harness(
             "conf/config.json",

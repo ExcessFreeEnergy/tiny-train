@@ -35,14 +35,16 @@ from tinygrad.nn.state import get_parameters, get_state_dict, safe_save
 from model import GPT
 
 
-def load_best_config(config_path: str = "conf/best_config.json") -> dict:
-    if not os.path.exists(config_path):
-        for alt_path in ["conf/config.json", "best_config.json", "config.json"]:
-            if os.path.exists(alt_path):
-                config_path = alt_path
-                break
-    with open(config_path) as f:
-        return json.load(f)
+def load_config(config_path: str | None = None) -> dict:
+    candidates = []
+    if config_path:
+        candidates.append(config_path)
+    candidates.extend(["conf/config.json", "conf/best_config.json", "config.json", "best_config.json"])
+    for path in candidates:
+        if path and os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+    raise FileNotFoundError("No configuration JSON file found.")
 
 
 def get_lr_schedule(it: int, max_iters: int, warmup_iters: int, max_lr: float, min_lr: float) -> float:
@@ -63,6 +65,7 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500, help="Total training steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-interval", type=int, default=50, help="Steps between validation evaluations")
+    parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
     parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
     args = parser.parse_args()
@@ -71,7 +74,7 @@ def main():
     if disable_debug:
         os.environ["DEBUG"] = "0"
 
-    config = load_best_config()
+    config = load_config(args.config)
 
     beam_val = str(config.get("BEAM", 4))
     os.environ["BEAM"] = os.environ.get("BEAM", beam_val)
@@ -323,4 +326,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        sys.stderr.write(f"\n[TRAINER ERROR] Incompatible configuration: {e}\n")
+        sys.stderr.flush()
+        os._exit(1)

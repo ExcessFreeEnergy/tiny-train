@@ -220,7 +220,7 @@ def main():
     # Phase 1: OOM-Safe Micro-Batch Sweep
     if not args.skip_sweep:
         print("\n--- Phase 1: Micro-Batch Saturation Sweep ---")
-        find_optimal_batch_size(active_config, target_effective_batch=256)
+        winning_batch, winning_accum = find_optimal_batch_size(active_config)
         active_config = load_json(config_path, active_config)
 
     best_config = copy.deepcopy(active_config)
