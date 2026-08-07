@@ -14,15 +14,15 @@ import sys
 import time
 
 
-def load_config(config_path: str = "conf/config.json") -> dict:
-    if not os.path.exists(config_path):
-        for alt_path in ["config.json", "conf/best_config.json", "best_config.json"]:
-            if os.path.exists(alt_path):
-                config_path = alt_path
-                break
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            cfg = json.load(f)
+def load_config(config_path: str | None = None) -> dict:
+    candidates = []
+    if config_path:
+        candidates.append(config_path)
+    candidates.extend(["conf/best_config.json", "conf/config.json", "best_config.json", "config.json"])
+    for path in candidates:
+        if path and os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
     else:
         cfg = {
             "MICRO_BATCH_SIZE": 16,

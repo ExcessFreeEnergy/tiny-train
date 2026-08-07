@@ -11,41 +11,53 @@ import datetime
 import json
 import math
 import os
-
-os.environ["ALLOW_TF32"] = os.environ.get("ALLOW_TF32", "1")
-os.environ["TINYCACHE"] = os.environ.get("TINYCACHE", "1")
-os.environ["HCQ"] = os.environ.get("HCQ", "1")
-os.environ["TC"] = "1"
-os.environ["TENSOR_CORES"] = "1"
-
+import re
 import sys
 import time
 
-# Add this immediately to prevent TinyJit AST traversal from crashing
-sys.setrecursionlimit(50000)
+# Ensure sys.stdout is unbuffered / line-buffered for real-time log streaming
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
+# Add paths immediately
+sys.setrecursionlimit(50000)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-
-import numpy as np
-from tinygrad import Tensor, TinyJit, dtypes
-from tinygrad.device import Device
-from tinygrad.nn.optim import AdamW
-from tinygrad.nn.state import get_parameters, get_state_dict, safe_save
-
-from model import GPT
 
 
 def load_config(config_path: str | None = None) -> dict:
     candidates = []
     if config_path:
         candidates.append(config_path)
-    candidates.extend(["conf/config.json", "conf/best_config.json", "config.json", "best_config.json"])
+    candidates.extend(["conf/best_config.json", "conf/config.json", "best_config.json", "config.json"])
     for path in candidates:
         if path and os.path.exists(path):
             with open(path) as f:
                 return json.load(f)
     raise FileNotFoundError("No configuration JSON file found.")
+
+
+# Set up optimization environment variables BEFORE tinygrad import
+_preload_config = {}
+try:
+    _preload_config = load_config()
+except Exception:
+    pass
+
+os.environ["ALLOW_TF32"] = os.environ.get("ALLOW_TF32", str(_preload_config.get("ALLOW_TF32", "1")))
+os.environ["TINYCACHE"] = os.environ.get("TINYCACHE", "1")
+os.environ["HCQ"] = os.environ.get("HCQ", "1")
+os.environ["TC"] = "1"
+os.environ["TENSOR_CORES"] = "1"
+os.environ["BEAM"] = os.environ.get("BEAM", str(_preload_config.get("BEAM", "2")))
+
+import numpy as np
+from tinygrad import Tensor, TinyJit, dtypes
+from tinygrad.device import Device
+from tinygrad.nn.optim import AdamW
+from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict, safe_load, safe_save
+
+from model import GPT
 
 
 def get_lr_schedule(it: int, max_iters: int, warmup_iters: int, max_lr: float, min_lr: float) -> float:
@@ -69,6 +81,8 @@ def main():
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
     parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
+    parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
+    parser.add_argument("--resume-path", type=str, default=None, help="Explicit path to checkpoint file to resume from")
     args = parser.parse_args()
 
     disable_debug = args.disable_debug or args.debug_level == 0 or os.environ.get("DEBUG") == "0"
@@ -77,7 +91,7 @@ def main():
 
     config = load_config(args.config)
 
-    beam_val = str(config.get("BEAM", 4))
+    beam_val = str(config.get("BEAM", 2))
     os.environ["BEAM"] = os.environ.get("BEAM", beam_val)
 
     default_float_str = str(config.get("DEFAULT_FLOAT", "BFLOAT16")).upper()
@@ -125,10 +139,10 @@ def main():
         train_bin = "data/TinyStories/train.bin"
 
     if os.path.exists(train_bin):
-        print(f"📦 Loading training dataset: '{train_bin}'")
+        print(f"📦 Loading training dataset: '{train_bin}'", flush=True)
         train_data = np.memmap(train_bin, dtype=np.uint16, mode="r")
     else:
-        print("⚠️ Training binary dataset not found. Using synthetic random buffer...")
+        print("⚠️ Training binary dataset not found. Using synthetic random buffer...", flush=True)
         train_data = np.random.randint(0, vocab_size, size=(10000000,), dtype=np.uint16)
 
     if os.path.exists(valid_bin):
@@ -152,14 +166,50 @@ def main():
     start_time = time.time()
     start_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # Checkpoint Resume Auto-detection
+    resumed_step = 0
+    ckpt_path_to_load = args.resume_path
+
+    if not ckpt_path_to_load and args.resume:
+        if os.path.exists(args.checkpoint_dir):
+            pattern = re.compile(rf"model_{args.model_size.lower()}_step_(\d+)\.safetensors$")
+            max_step = -1
+            best_ckpt = None
+            for filename in os.listdir(args.checkpoint_dir):
+                match = pattern.match(filename)
+                if match:
+                    s = int(match.group(1))
+                    if s > max_step:
+                        max_step = s
+                        best_ckpt = os.path.join(args.checkpoint_dir, filename)
+            if best_ckpt and max_step > 0:
+                ckpt_path_to_load = best_ckpt
+                resumed_step = max_step
+
+    if ckpt_path_to_load:
+        if not os.path.exists(ckpt_path_to_load):
+            raise FileNotFoundError(f"Checkpoint file '{ckpt_path_to_load}' not found.")
+        if resumed_step == 0:
+            match = re.search(r"_step_(\d+)\.safetensors$", ckpt_path_to_load)
+            if match:
+                resumed_step = int(match.group(1))
+        print(f"🔄 Resuming model weights from checkpoint: '{ckpt_path_to_load}' (starting step {resumed_step + 1})", flush=True)
+        state = safe_load(ckpt_path_to_load)
+        load_state_dict(model, state)
+        print(f"✅ State dict loaded successfully from '{ckpt_path_to_load}'", flush=True)
+
+    start_step = resumed_step + 1
+
     param_count = model.num_params()
-    print("\n=======================================================")
-    print(f"🚀 MAIN PRODUCTION TRAINER INITIALIZED ({args.model_size})")
-    print(f"Start Time: {start_datetime}")
-    print(f"Parameters: {param_count:,} | Padded Vocab: {model.vocab_size}")
-    print(f"Micro-Batch: {micro_batch_size} | Grad Accum: {grad_accum_steps} | Effective Batch: {eff_batch_size} | Seq Len: {seq_len}")
-    print(f"Precision: {default_float_str} | RoPE: {use_rope} | SwiGLU: {use_swiglu}")
-    print("=======================================================\n")
+    print("\n=======================================================", flush=True)
+    print(f"🚀 MAIN PRODUCTION TRAINER INITIALIZED ({args.model_size})", flush=True)
+    print(f"Start Time: {start_datetime}", flush=True)
+    if start_step > 1:
+        print(f"Resuming From: Step {start_step} / {args.total_steps} (Checkpoint: {ckpt_path_to_load})", flush=True)
+    print(f"Parameters: {param_count:,} | Padded Vocab: {model.vocab_size}", flush=True)
+    print(f"Micro-Batch: {micro_batch_size} | Grad Accum: {grad_accum_steps} | Effective Batch: {eff_batch_size} | Seq Len: {seq_len}", flush=True)
+    print(f"Precision: {default_float_str} | RoPE: {use_rope} | SwiGLU: {use_swiglu} | BEAM: {os.environ.get('BEAM')}", flush=True)
+    print("=======================================================\n", flush=True)
 
     params = get_parameters(model)
 
@@ -253,7 +303,7 @@ def main():
     last_loss_val = 0.0
 
     # Production Training Loop
-    for step in range(1, args.total_steps + 1):
+    for step in range(start_step, args.total_steps + 1):
         cur_lr = get_lr_schedule(step, args.total_steps, warmup_iters, max_lr, min_lr)
         lr_tensor.assign([cur_lr]).realize()
 
@@ -276,12 +326,12 @@ def main():
         step_times.append(step_ms)
 
         total_steps = args.total_steps
-        if step == 1 or step == total_steps or step % 1000 == 0 or step % args.eval_interval == 0:
+        if step == start_step or step == total_steps or step % 1000 == 0 or step % args.eval_interval == 0:
             last_loss_val = step_loss
             tokens_per_sec = (eff_batch_size * seq_len) / (step_ms / 1000.0) if step_ms > 0 else 0.0
 
-            if not disable_debug and (step == 1 or step == total_steps or step % 1000 == 0):
-                print(f"Step {step:6d} / {total_steps} | Loss: {last_loss_val:.4f} | Tok/sec: {tokens_per_sec:.0f}")
+            if not disable_debug and (step == start_step or step == total_steps or step % 1000 == 0 or step % args.eval_interval == 0):
+                print(f"Step {step:6d} / {total_steps} | Loss: {last_loss_val:.4f} | Tok/sec: {tokens_per_sec:.0f}", flush=True)
 
         # Checkpointing & Validation Eval
         if step % args.eval_interval == 0 or step == args.total_steps:
@@ -289,16 +339,16 @@ def main():
             val_logits = model.forward(Tensor(x_v[:micro_batch_size]))
             val_loss_tensor = val_logits.sparse_categorical_crossentropy(Tensor(y_v[:micro_batch_size])).realize()
             val_loss = float(val_loss_tensor.cast(dtypes.float).item())
-            print(f"📊 Validation Loss at step {step}: {val_loss:.4f}")
+            print(f"📊 Validation Loss at step {step}: {val_loss:.4f}", flush=True)
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")
             state_dict = get_state_dict(model)
             safe_save(state_dict, ckpt_path)
-            print(f"💾 Checkpoint saved to '{ckpt_path}'")
+            print(f"💾 Checkpoint saved to '{ckpt_path}'", flush=True)
 
-    avg_step_ms = float(np.mean(step_times[1:])) if len(step_times) > 1 else float(np.mean(step_times))
-    avg_tput = eff_batch_size / (avg_step_ms / 1000.0)
-    avg_gflops = (flops_per_step / (avg_step_ms / 1000.0)) / 1e9
+    avg_step_ms = float(np.mean(step_times[1:])) if len(step_times) > 1 else (float(np.mean(step_times)) if step_times else 0.0)
+    avg_tput = eff_batch_size / (avg_step_ms / 1000.0) if avg_step_ms > 0 else 0.0
+    avg_gflops = ((flops_per_step / (avg_step_ms / 1000.0)) / 1e9) if avg_step_ms > 0 else 0.0
     avg_mfu = (avg_gflops / 330000.0) * 100.0
 
     end_time = time.time()
@@ -324,17 +374,17 @@ def main():
         "padded_vocab_size": model.vocab_size,
     }
 
-    print("\n=======================================================")
-    print(f"🏆 {args.model_size} PRODUCTION TRAINING COMPLETE!")
-    print("=======================================================")
-    print(f"Start Time: {start_datetime}")
-    print(f"End Time:   {end_datetime}")
-    print(f"Total Run Duration: {total_elapsed_formatted} ({total_elapsed_sec:.2f}s)")
-    print(f"Average Step Time: {avg_step_ms:.2f} ms")
-    print(f"Average Throughput: {avg_tput:.1f} samples/sec")
-    print(f"Average Compute: {avg_gflops:.1f} GFLOPS ({avg_gflops / 1000.0:.2f} TFLOPS)")
-    print(f"Average MFU: {avg_mfu:.2f}% (Target: ~35%)")
-    print("=======================================================\n")
+    print("\n=======================================================", flush=True)
+    print(f"🏆 {args.model_size} PRODUCTION TRAINING COMPLETE!", flush=True)
+    print("=======================================================", flush=True)
+    print(f"Start Time: {start_datetime}", flush=True)
+    print(f"End Time:   {end_datetime}", flush=True)
+    print(f"Total Run Duration: {total_elapsed_formatted} ({total_elapsed_sec:.2f}s)", flush=True)
+    print(f"Average Step Time: {avg_step_ms:.2f} ms", flush=True)
+    print(f"Average Throughput: {avg_tput:.1f} samples/sec", flush=True)
+    print(f"Average Compute: {avg_gflops:.1f} GFLOPS ({avg_gflops / 1000.0:.2f} TFLOPS)", flush=True)
+    print(f"Average MFU: {avg_mfu:.2f}% (Target: ~35%)", flush=True)
+    print("=======================================================\n", flush=True)
 
     sys.stdout.write("\n=== HARNESS TELEMETRY METRICS ===\n")
     sys.stdout.write(json.dumps(telemetry, indent=2) + "\n")
