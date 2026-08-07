@@ -310,16 +310,37 @@ def main():
         x_b, y_b = get_batch(train_data, step)
 
         t0 = time.time()
-        step_loss_tensor = Tensor([0.0], device=params[0].device)
-        for i in range(grad_accum_steps):
-            x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size])
-            y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size])
-            loss_micro = accum_fn(x_jit, y_jit)
-            step_loss_tensor = step_loss_tensor + loss_micro
+        try:
+            step_loss_tensor = Tensor([0.0], device=params[0].device)
+            for i in range(grad_accum_steps):
+                x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+                y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+                loss_micro = accum_fn(x_jit, y_jit)
+                step_loss_tensor = step_loss_tensor + loss_micro
 
-        opt_fn()
-        Device[Device.DEFAULT].synchronize()
-        step_loss = float(step_loss_tensor.cast(dtypes.float).item())
+            opt_fn()
+            Device[Device.DEFAULT].synchronize()
+            step_loss = float(step_loss_tensor.cast(dtypes.float).item())
+        except Exception as step_err:
+            sys.stderr.write(f"\n⚠️ [RECOVERY WARNING] Step {step} execution error ({step_err}). Resetting JIT state...\n")
+            sys.stderr.flush()
+            try:
+                Device[Device.DEFAULT].synchronize()
+            except Exception:
+                pass
+            if use_jit:
+                accum_fn = TinyJit(accum_step)
+                opt_fn = TinyJit(opt_step)
+            step_loss_tensor = Tensor([0.0], device=params[0].device)
+            for i in range(grad_accum_steps):
+                x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+                y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+                loss_micro = accum_fn(x_jit, y_jit)
+                step_loss_tensor = step_loss_tensor + loss_micro
+            opt_fn()
+            Device[Device.DEFAULT].synchronize()
+            step_loss = float(step_loss_tensor.cast(dtypes.float).item())
+
         t1 = time.time()
 
         step_ms = (t1 - t0) * 1000.0
