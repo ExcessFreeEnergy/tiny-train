@@ -123,6 +123,9 @@ python src/train_production.py --model-size 125M --total-steps 500
 
 # Specify custom checkpoint directory and eval interval
 python src/train_production.py --model-size 125M --total-steps 2000 --eval-interval 100 --checkpoint-dir checkpoints
+
+# Full 1 Billion Token Production Training Run (30,518 steps ~2h 55m)
+uv run python src/train_production.py --model-size 125M --total-steps 30518 --eval-interval 500 --checkpoint-dir checkpoints 2>&1 | tee logs/training_1B.log
 ```
 
 ---

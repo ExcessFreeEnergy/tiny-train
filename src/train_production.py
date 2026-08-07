@@ -7,6 +7,7 @@ Features Ultra-Fast BEAM Compilation (< 40s) with Single-Step @TinyJit Scoping &
 # ruff: noqa: E402
 
 import argparse
+import datetime
 import json
 import math
 import os
@@ -148,9 +149,13 @@ def main():
         pad_vocab_multiple=pad_vocab_mult,
         pad_vocab_power_of_2=pad_vocab_p2,
     )
+    start_time = time.time()
+    start_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     param_count = model.num_params()
     print("\n=======================================================")
     print(f"🚀 MAIN PRODUCTION TRAINER INITIALIZED ({args.model_size})")
+    print(f"Start Time: {start_datetime}")
     print(f"Parameters: {param_count:,} | Padded Vocab: {model.vocab_size}")
     print(f"Micro-Batch: {micro_batch_size} | Grad Accum: {grad_accum_steps} | Effective Batch: {eff_batch_size} | Seq Len: {seq_len}")
     print(f"Precision: {default_float_str} | RoPE: {use_rope} | SwiGLU: {use_swiglu}")
@@ -296,7 +301,16 @@ def main():
     avg_gflops = (flops_per_step / (avg_step_ms / 1000.0)) / 1e9
     avg_mfu = (avg_gflops / 330000.0) * 100.0
 
+    end_time = time.time()
+    end_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_elapsed_sec = end_time - start_time
+    total_elapsed_formatted = str(datetime.timedelta(seconds=round(total_elapsed_sec)))
+
     telemetry = {
+        "start_time": start_datetime,
+        "end_time": end_datetime,
+        "total_elapsed_sec": round(total_elapsed_sec, 2),
+        "total_elapsed_formatted": total_elapsed_formatted,
         "step_time_ms": round(avg_step_ms, 3),
         "peak_gflops": round(avg_gflops, 1),
         "mfu_pct": round(avg_mfu, 2),
@@ -313,6 +327,9 @@ def main():
     print("\n=======================================================")
     print(f"🏆 {args.model_size} PRODUCTION TRAINING COMPLETE!")
     print("=======================================================")
+    print(f"Start Time: {start_datetime}")
+    print(f"End Time:   {end_datetime}")
+    print(f"Total Run Duration: {total_elapsed_formatted} ({total_elapsed_sec:.2f}s)")
     print(f"Average Step Time: {avg_step_ms:.2f} ms")
     print(f"Average Throughput: {avg_tput:.1f} samples/sec")
     print(f"Average Compute: {avg_gflops:.1f} GFLOPS ({avg_gflops / 1000.0:.2f} TFLOPS)")
