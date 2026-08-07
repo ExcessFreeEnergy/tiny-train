@@ -46,7 +46,7 @@ except Exception:
 
 os.environ["ALLOW_TF32"] = os.environ.get("ALLOW_TF32", str(_preload_config.get("ALLOW_TF32", "1")))
 os.environ["TINYCACHE"] = os.environ.get("TINYCACHE", "1")
-os.environ["HCQ"] = os.environ.get("HCQ", "1")
+os.environ["HCQ"] = os.environ.get("HCQ", "0")
 os.environ["TC"] = "1"
 os.environ["TENSOR_CORES"] = "1"
 os.environ["BEAM"] = os.environ.get("BEAM", str(_preload_config.get("BEAM", "2")))
