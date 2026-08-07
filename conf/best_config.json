@@ -3,7 +3,7 @@
   "GRAD_ACCUMULATION_STEPS": 4,
   "DEFAULT_FLOAT": "BFLOAT16",
   "ALLOW_TF32": 1,
-  "BEAM": 1,
+  "BEAM": 2,
   "TC": 1,
   "TENSOR_CORES": 1,
   "JIT": 1,

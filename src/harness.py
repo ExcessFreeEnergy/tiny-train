@@ -85,7 +85,13 @@ def parse_telemetry_from_output(output_text: str) -> dict:
 
     nan_detected = "NaN/Inf detected" in output_text or "nan" in output_text.lower()
     oom_detected = "OutOfMemory" in output_text or "CUDA error: out of memory" in output_text or "OOM" in output_text or "NV_ERR_NO_MEMORY" in output_text
-    wait_timeout_detected = "Wait timeout" in output_text or "signal is not set to" in output_text or "timeline_signal.wait" in output_text or "TRAINER ERROR" in output_text or "weakref" in output_text
+    wait_timeout_detected = (
+        "Wait timeout" in output_text
+        or "signal is not set to" in output_text
+        or "timeline_signal.wait" in output_text
+        or "TRAINER ERROR" in output_text
+        or "weakref" in output_text
+    )
     recursion_detected = "RecursionError" in output_text or "recursion limit" in output_text or "recursion depth" in output_text
 
     if "step_time_ms" not in base_metrics:
@@ -339,9 +345,7 @@ def find_optimal_batch_size(
             throughput = (eff_batch / (step_time_ms / 1000.0)) if step_time_ms > 0 else 0.0
             ai = metrics.get("arithmetic_intensity", 0.0)
 
-            print(
-                f"[SWEEP RESULT] MB={test_batch}, GA={test_accum} (Eff={eff_batch}): {throughput:.1f} smp/s | AI: {ai:.2f} | Step Time: {step_time_ms:.2f}ms"
-            )
+            print(f"[SWEEP RESULT] MB={test_batch}, GA={test_accum} (Eff={eff_batch}): {throughput:.1f} smp/s | AI: {ai:.2f} | Step Time: {step_time_ms:.2f}ms")
 
             if throughput > best_throughput:
                 best_throughput = throughput

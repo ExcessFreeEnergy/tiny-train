@@ -156,7 +156,7 @@ class GPT:
             x = block(x, cos=self.cos, sin=self.sin)
 
         x = self.rms_f(x)
-        logits = x @ self.wte.T
+        logits = x @ self.wte.T.contiguous()
         return logits
 
     def num_params(self) -> int:
