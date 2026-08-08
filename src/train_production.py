@@ -362,7 +362,7 @@ def main():
             master_p.grad = p.accum_grad.cast(dtypes.float32) * clip_coeff
 
         opt_nodes = optimizer.schedule_step()
-        sync_nodes = [p.assign(master_p.cast(dtypes.bfloat16)) for p, master_p in zip(params, master_params)]
+        sync_nodes = [p.assign(master_p.cast(p.dtype)) for p, master_p in zip(params, master_params)]
         wipe_nodes = [p.accum_grad.assign(Tensor.zeros_like(p.accum_grad)) for p in params]
 
         Tensor.realize(*opt_nodes, *sync_nodes, *wipe_nodes)
