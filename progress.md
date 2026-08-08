@@ -12,6 +12,7 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | **tinygrad BEAM=4 Initial** | 125M | JIT + BEAM=4 | 2,400.0s | 1,953.14 ms | 65.5 | 13.68 TFLOPS | 4.14% | 5.9411 |
 | 🚀 **tinygrad Post-Audit Winner** | **125M** | **`@TinyJit` + BEAM=2** | **36.42s** | **208.95 ms** | **76.6** | **59.17 TFLOPS** | **17.93%** | **6.1562** |
 | ⚡ **tinygrad Harness Suite (BEAM=4)** | **125M** | **`@TinyJit` + BEAM=4** | **100.45s** | **-** | **-** | **87.02 TFLOPS** | **26.37%** | **N/A (3-step suite)** |
+| 🛠️ **tinygrad Run 41 (Post-Bugfix)** | **125M** | **`@TinyJit` + BEAM=2** | **40.47s** | **361.30 ms** | **354.3** | **68.52 TFLOPS** | **20.76%** | **9.7500** |
 | **PyTorch Default** | 125M | `torch.compile` | 3.7s | 159.33 ms | 401.7 | 83.83 TFLOPS | 25.40% | 5.9404 |
 | **PyTorch Autotune 125M** | 125M | `max-autotune` | 21.8s | 271.91 ms | 235.4 | 98.25 TFLOPS | 29.77% | 6.0209 |
 | **PyTorch 350M Scale** | 350M | `reduce-overhead` | 25.2s | 237.70 ms | 33.7 | 103.03 TFLOPS | 31.22% | 7.3492 |
@@ -84,4 +85,11 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 
 8. **BEAM Compiler Group Reduction & Tensor Core Tile Re-Alignment**:
    Pads vocabulary size to 14,080 ($110 \times 128$), factoring cleanly into standard CUDA warp (32) and block (128, 256) boundaries. Setting `BEAM=4` with `BEAM_DEV_TIMEOUT=0` during offline compiler sweeps forces tinygrad to test `OptOps.GROUP` warp shuffle (`__shfl_xor_sync`) actions, transforming strided VRAM reads into coalesced row-wise reads (boosting bandwidth from ~5 GB/s to > 400 GB/s and dropping reduction kernel time from ~22 ms to < 1.5 ms) while `TC=1` grid alignment lifts LM Head GEMM compute throughput above 100 TFLOPS.
+
+9. **Run 41 Quad-Bug Resolution & Shadow Weight JIT Synchronization**:
+   - **Data Starvation (Zero-Feeding)**: Appended `.realize()` to `x_jit.assign()` and `y_jit.assign()` input slice assignments, triggering CPU-to-GPU memory copies before kernel execution.
+   - **FP32 Shadow Weights & JIT Node Realization**: Maintained native `BFLOAT16` parameters in `model.py` to prevent HBM memory bandwidth doubling while creating detached FP32 `master_params` in `train_production.py`. Updated `opt_step()` to realize all nodes simultaneously (`Tensor.realize(*opt_nodes, *sync_nodes, *wipe_nodes)`), ensuring `@TinyJit` captures the optimizer update, shadow-to-model sync, and gradient wipe within the JIT graph.
+   - **Asynchronous Loss Accumulation**: Replaced lazy unrolled addition graphs with asynchronous in-loop realization (`step_loss_tensor.assign(step_loss_tensor + loss_micro).realize()`), avoiding GPU memory unrolling while preventing CPU pipeline stalls.
+   - **Validation Tensor Sequence Alignment**: Flattened 3D validation logits `[B, T, V]` to 2D `[B*T, V]` and target labels to 1D `[B*T]`, resolving sequence broadcasting mismatches and restoring valid evaluation loss metrics (**9.7500** at step 3 on 125M).
+
 

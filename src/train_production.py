@@ -54,10 +54,88 @@ os.environ["BEAM"] = os.environ.get("BEAM", str(_preload_config.get("BEAM", "2")
 import numpy as np
 from tinygrad import Tensor, TinyJit, dtypes
 from tinygrad.device import Device
-from tinygrad.nn.optim import AdamW
+from tinygrad.nn.optim import AdamW, OptimizerGroup
 from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict, safe_load, safe_save
 
 from model import GPT
+
+
+def save_checkpoint(model: GPT, optimizer: OptimizerGroup, step: int, ckpt_path: str, master_params: list[Tensor] | None = None):
+    state = get_state_dict(model)
+    param_to_key = {id(p): k for k, p in state.items()}
+    if master_params:
+        params = get_parameters(model)
+        for p, mp in zip(params, master_params):
+            k = param_to_key.get(id(p))
+            if k:
+                param_to_key[id(mp)] = k
+
+    opt_decay, opt_nodecay = optimizer.optimizers[0], optimizer.optimizers[1]
+    state["opt.decay.b1_t"] = opt_decay.b1_t
+    state["opt.decay.b2_t"] = opt_decay.b2_t
+    state["opt.nodecay.b1_t"] = opt_nodecay.b1_t
+    state["opt.nodecay.b2_t"] = opt_nodecay.b2_t
+
+    for opt in optimizer.optimizers:
+        for i, p in enumerate(opt.params):
+            param_key = param_to_key.get(id(p))
+            if param_key:
+                state[f"opt.m.{param_key}"] = opt.m[i]
+                state[f"opt.v.{param_key}"] = opt.v[i]
+
+    state["global_step"] = Tensor([step], dtype=dtypes.int32)
+    safe_save(state, ckpt_path)
+
+
+def load_checkpoint(model: GPT, optimizer: OptimizerGroup, ckpt_path: str, master_params: list[Tensor] | None = None) -> int:
+    state = safe_load(ckpt_path)
+    load_state_dict(model, state)
+
+    params = get_parameters(model)
+    if master_params:
+        for p, mp in zip(params, master_params):
+            mp.assign(p.cast(dtypes.float32)).realize()
+
+    model_state = get_state_dict(model)
+    param_to_key = {id(p): k for k, p in model_state.items()}
+    if master_params:
+        for p, mp in zip(params, master_params):
+            k = param_to_key.get(id(p))
+            if k:
+                param_to_key[id(mp)] = k
+
+    resumed_step = 0
+    if "global_step" in state:
+        resumed_step = int(state["global_step"].cast(dtypes.int32).to(Device.DEFAULT).item())
+
+    opt_decay, opt_nodecay = optimizer.optimizers[0], optimizer.optimizers[1]
+    if "opt.decay.b1_t" in state:
+        opt_decay.b1_t.assign(state["opt.decay.b1_t"].to(opt_decay.b1_t.device))
+    if "opt.decay.b2_t" in state:
+        opt_decay.b2_t.assign(state["opt.decay.b2_t"].to(opt_decay.b2_t.device))
+    if "opt.nodecay.b1_t" in state:
+        opt_nodecay.b1_t.assign(state["opt.nodecay.b1_t"].to(opt_nodecay.b1_t.device))
+    if "opt.nodecay.b2_t" in state:
+        opt_nodecay.b2_t.assign(state["opt.nodecay.b2_t"].to(opt_nodecay.b2_t.device))
+
+    restored_buffers = 0
+    for opt in optimizer.optimizers:
+        for i, p in enumerate(opt.params):
+            param_key = param_to_key.get(id(p))
+            if param_key:
+                m_key = f"opt.m.{param_key}"
+                v_key = f"opt.v.{param_key}"
+                if m_key in state and v_key in state:
+                    opt.m[i].assign(state[m_key].to(opt.m[i].device))
+                    opt.v[i].assign(state[v_key].to(opt.v[i].device))
+                    restored_buffers += 1
+
+    if restored_buffers > 0:
+        print(f"✅ Restored optimizer momentum & variance buffers ({restored_buffers} tensors)", flush=True)
+    else:
+        print("⚠️ Checkpoint lacks optimizer state. Momentum buffers will start from zero.", flush=True)
+
+    return resumed_step
 
 
 def get_lr_schedule(it: int, max_iters: int, warmup_iters: int, max_lr: float, min_lr: float) -> float:
@@ -122,10 +200,10 @@ def main():
         d_ff = 3072
     else:
         vocab_size = int(config.get("VOCAB_SIZE", 13970))
-        d_model = int(config.get("D_MODEL", 288))
-        n_layers = int(config.get("N_LAYERS", 6))
-        n_heads = int(config.get("N_HEADS", 6))
-        d_ff = int(config.get("D_FF", 1152))
+        d_model = 288
+        n_layers = 6
+        n_heads = 6
+        d_ff = 1152
 
     use_swiglu = bool(config.get("USE_SWIGLU", 1))
     use_rope = bool(config.get("USE_ROPE", 1))
@@ -186,21 +264,55 @@ def main():
                 ckpt_path_to_load = best_ckpt
                 resumed_step = max_step
 
+    if ckpt_path_to_load and not os.path.exists(ckpt_path_to_load):
+        raise FileNotFoundError(f"Checkpoint file '{ckpt_path_to_load}' not found.")
+
+    param_count = model.num_params()
+    params = get_parameters(model)
+
+    # SEVER RNG GRAPH: Force all glorot_uniform weights into VRAM
+    # so the optimizer never sees the RNG initialization history.
+    sys.stderr.write("[train_production.py] Realizing model weights into VRAM...\n")
+    Tensor.realize(*params)
+
+    # Detached FP32 Master Parameters for Optimizer
+    master_params = [p.cast(dtypes.float32).detach().realize() for p in params]
+    for master_p in master_params:
+        master_p.grad = None
+
+    # Pre-allocate gradient accumulation buffers as zeros and sever graph
+    for p in params:
+        p.accum_grad = Tensor.zeros_like(p).realize()
+        p.grad = None
+
+    # Parameter rank partitioning for weight decay on FP32 master parameters
+    decay_master = [mp for mp, p in zip(master_params, params) if len(p.shape) >= 2]
+    nodecay_master = [mp for mp, p in zip(master_params, params) if len(p.shape) < 2]
+    weight_decay = float(config.get("WEIGHT_DECAY", 0.01))
+    max_grad_norm = float(config.get("MAX_GRAD_NORM", 1.0))
+
+    opt_decay = AdamW(decay_master, lr=max_lr, weight_decay=weight_decay)
+    opt_nodecay = AdamW(nodecay_master, lr=max_lr, weight_decay=0.0)
+    optimizer = OptimizerGroup(opt_decay, opt_nodecay)
+
+    lr_tensor = Tensor([max_lr], dtype=dtypes.float, device=params[0].device).realize()
+    opt_decay.lr = lr_tensor
+    opt_nodecay.lr = lr_tensor
+
+    # Load initial state dict and optimizer momentum/variance buffers if resuming
     if ckpt_path_to_load:
-        if not os.path.exists(ckpt_path_to_load):
-            raise FileNotFoundError(f"Checkpoint file '{ckpt_path_to_load}' not found.")
-        if resumed_step == 0:
+        print(f"🔄 Resuming training state from checkpoint: '{ckpt_path_to_load}'", flush=True)
+        loaded_step = load_checkpoint(model, optimizer, ckpt_path_to_load, master_params=master_params)
+        if loaded_step > 0:
+            resumed_step = loaded_step
+        elif resumed_step == 0:
             match = re.search(r"_step_(\d+)\.safetensors$", ckpt_path_to_load)
             if match:
                 resumed_step = int(match.group(1))
-        print(f"🔄 Resuming model weights from checkpoint: '{ckpt_path_to_load}' (starting step {resumed_step + 1})", flush=True)
-        state = safe_load(ckpt_path_to_load)
-        load_state_dict(model, state)
-        print(f"✅ State dict loaded successfully from '{ckpt_path_to_load}'", flush=True)
+        print(f"✅ State loaded successfully. Resume starting step {resumed_step + 1}", flush=True)
 
     start_step = resumed_step + 1
 
-    param_count = model.num_params()
     print("\n=======================================================", flush=True)
     print(f"🚀 MAIN PRODUCTION TRAINER INITIALIZED ({args.model_size})", flush=True)
     print(f"Start Time: {start_datetime}", flush=True)
@@ -210,22 +322,6 @@ def main():
     print(f"Micro-Batch: {micro_batch_size} | Grad Accum: {grad_accum_steps} | Effective Batch: {eff_batch_size} | Seq Len: {seq_len}", flush=True)
     print(f"Precision: {default_float_str} | RoPE: {use_rope} | SwiGLU: {use_swiglu} | BEAM: {os.environ.get('BEAM')}", flush=True)
     print("=======================================================\n", flush=True)
-
-    params = get_parameters(model)
-
-    # SEVER RNG GRAPH: Force all glorot_uniform weights into VRAM
-    # so the optimizer never sees the RNG initialization history.
-    sys.stderr.write("[train_production.py] Realizing model weights into VRAM...\n")
-    Tensor.realize(*params)
-
-    # Pre-allocate gradient accumulation buffers as zeros and sever graph
-    for p in params:
-        p.accum_grad = Tensor.zeros_like(p).realize()
-        p.grad = None
-
-    optimizer = AdamW(params, lr=max_lr)
-    lr_tensor = Tensor([max_lr], dtype=dtypes.float, device=params[0].device).realize()
-    optimizer.lr = lr_tensor
 
     flops_per_step = 6.0 * param_count * eff_batch_size * seq_len
 
@@ -256,26 +352,27 @@ def main():
         return chunk_loss
 
     def opt_step():
+        # Global FP32 L2 Gradient Norm Clipping
+        sq_norms = [(p.accum_grad.cast(dtypes.float32) ** 2).sum() for p in params]
+        total_norm_sq = sum(sq_norms)
+        global_norm = total_norm_sq.sqrt()
+        clip_coeff = (max_grad_norm / (global_norm + 1e-6)).clip(max_=1.0)
+
+        for p, master_p in zip(params, master_params):
+            master_p.grad = p.accum_grad.cast(dtypes.float32) * clip_coeff
+
+        opt_nodes = optimizer.schedule_step()
+        sync_nodes = [p.assign(master_p.cast(dtypes.bfloat16)) for p, master_p in zip(params, master_params)]
+        wipe_nodes = [p.accum_grad.assign(Tensor.zeros_like(p.accum_grad)) for p in params]
+
+        Tensor.realize(*opt_nodes, *sync_nodes, *wipe_nodes)
+
+        for master_p in master_params:
+            master_p.grad = None
         for p in params:
-            p.grad = p.accum_grad
-        Tensor.realize(*optimizer.schedule_step())
-        for p in params:
-            p.accum_grad.assign(Tensor.zeros_like(p))
             p.grad = None
 
-    # 1. Fetch initialization batch
-    init_x, init_y = get_batch(train_data, 0)
-
-    # 2. Run ONE uncompiled step to force AdamW to allocate momentum buffers (m and v) in VRAM before JIT
-    sys.stderr.write("[train_production.py] Initializing optimizer states before JIT...\n")
-    for i in range(grad_accum_steps):
-        x_jit.assign(init_x[i * micro_batch_size : (i + 1) * micro_batch_size])
-        y_jit.assign(init_y[i * micro_batch_size : (i + 1) * micro_batch_size])
-        accum_step(x_jit, y_jit)
-    opt_step()
-    Device[Device.DEFAULT].synchronize()
-
-    # 3. NOW it is safe to wrap in TinyJit
+    # Wrap in TinyJit
     if use_jit:
         accum_fn = TinyJit(accum_step)
         opt_fn = TinyJit(opt_step)
@@ -289,10 +386,19 @@ def main():
     for w in range(2):
         xw, yw = get_batch(train_data, 100 + w)
         for i in range(grad_accum_steps):
-            x_jit.assign(xw[i * micro_batch_size : (i + 1) * micro_batch_size])
-            y_jit.assign(yw[i * micro_batch_size : (i + 1) * micro_batch_size])
+            x_jit.assign(xw[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
+            y_jit.assign(yw[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
             _ = accum_fn(x_jit, y_jit)
         opt_fn()
+        Device[Device.DEFAULT].synchronize()
+
+    # Reset buffer memory contents to exact checkpoint values after JIT allocation trace
+    if ckpt_path_to_load:
+        _ = load_checkpoint(model, optimizer, ckpt_path_to_load, master_params=master_params)
+        Tensor.realize(*params)
+        Tensor.realize(*master_params)
+        for opt in optimizer.optimizers:
+            Tensor.realize(*opt.m, *opt.v, opt.b1_t, opt.b2_t)
         Device[Device.DEFAULT].synchronize()
 
     # CRITICAL: This exact string allows harness.py to set jit_active=True
@@ -311,12 +417,12 @@ def main():
 
         t0 = time.time()
         try:
-            step_loss_tensor = Tensor([0.0], device=params[0].device)
+            step_loss_tensor = Tensor([0.0], device=params[0].device).realize()
             for i in range(grad_accum_steps):
-                x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size])
-                y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+                x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
+                y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
                 loss_micro = accum_fn(x_jit, y_jit)
-                step_loss_tensor = step_loss_tensor + loss_micro
+                step_loss_tensor.assign(step_loss_tensor + loss_micro).realize()
 
             opt_fn()
             Device[Device.DEFAULT].synchronize()
@@ -331,12 +437,12 @@ def main():
             if use_jit:
                 accum_fn = TinyJit(accum_step)
                 opt_fn = TinyJit(opt_step)
-            step_loss_tensor = Tensor([0.0], device=params[0].device)
+            step_loss_tensor = Tensor([0.0], device=params[0].device).realize()
             for i in range(grad_accum_steps):
-                x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size])
-                y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size])
+                x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
+                y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
                 loss_micro = accum_fn(x_jit, y_jit)
-                step_loss_tensor = step_loss_tensor + loss_micro
+                step_loss_tensor.assign(step_loss_tensor + loss_micro).realize()
             opt_fn()
             Device[Device.DEFAULT].synchronize()
             step_loss = float(step_loss_tensor.cast(dtypes.float).item())
@@ -358,14 +464,15 @@ def main():
         if step % args.eval_interval == 0 or step == args.total_steps:
             x_v, y_v = get_batch(valid_data, step + 999)
             val_logits = model.forward(Tensor(x_v[:micro_batch_size]))
-            val_loss_tensor = val_logits.sparse_categorical_crossentropy(Tensor(y_v[:micro_batch_size])).realize()
+            flat_val_logits = val_logits.reshape(-1, val_logits.shape[-1])
+            flat_val_y = Tensor(y_v[:micro_batch_size]).flatten()
+            val_loss_tensor = flat_val_logits.sparse_categorical_crossentropy(flat_val_y).realize()
             val_loss = float(val_loss_tensor.cast(dtypes.float).item())
             print(f"📊 Validation Loss at step {step}: {val_loss:.4f}", flush=True)
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")
-            state_dict = get_state_dict(model)
-            safe_save(state_dict, ckpt_path)
-            print(f"💾 Checkpoint saved to '{ckpt_path}'", flush=True)
+            save_checkpoint(model, optimizer, step, ckpt_path, master_params=master_params)
+            print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
 
     avg_step_ms = float(np.mean(step_times[1:])) if len(step_times) > 1 else (float(np.mean(step_times)) if step_times else 0.0)
     avg_tput = eff_batch_size / (avg_step_ms / 1000.0) if avg_step_ms > 0 else 0.0
