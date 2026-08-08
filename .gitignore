@@ -27,6 +27,7 @@ gigatoken/wheels/
 
 # Checkpoints & Model weights
 checkpoints/
+checkpoints_run_*/
 *.safetensors
 *.pt
 *.pth
