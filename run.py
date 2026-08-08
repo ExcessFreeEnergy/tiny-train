@@ -23,9 +23,12 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+import time
+
 import numpy as np
 import tiktoken
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, TinyJit, dtypes
+from tinygrad.device import Device
 from tinygrad.nn.state import get_parameters, load_state_dict, safe_load
 
 from src.model import GPT
@@ -91,8 +94,10 @@ def generate_text(
     temperature: float = 0.8,
     top_k: int = 40,
     seq_len: int = 256,
+    use_jit: bool = True,
+    profile: bool = False,
 ) -> str:
-    """Autoregressively generate text given a starting prompt."""
+    """Autoregressively generate text given a starting prompt using @TinyJit static shape acceleration."""
     orig_prompt_ids = tokenizer.encode(prompt)
     if not orig_prompt_ids:
         orig_prompt_ids = [50256]  # Fallback to EOS
@@ -105,22 +110,52 @@ def generate_text(
     current_ids = list(trimmed_prompt_ids)
     raw_vocab_size = model.raw_vocab_size
 
+    # Static input tensor buffer for JIT compilation
+    x_jit = Tensor.zeros(1, seq_len, dtype=dtypes.int32).realize()
+
+    def eval_step(x_in: Tensor) -> Tensor:
+        return model.forward(x_in)
+
+    if use_jit:
+        eval_fn = TinyJit(eval_step)
+        # JIT compilation warmup pass to keep TTFT fast during generation
+        x_jit.assign(np.zeros((1, seq_len), dtype=np.int32)).realize()
+        _ = eval_fn(x_jit).realize()
+        Device[Device.DEFAULT].synchronize()
+    else:
+        eval_fn = eval_step
+
     print(f'\n📝 Prompt: "{prompt}"', flush=True)
     print("-------------------------------------------------------", flush=True)
     sys.stdout.write(prompt)
     sys.stdout.flush()
 
-    for _ in range(max_new_tokens):
-        # Truncate context to max seq_len
-        ctx_ids = current_ids[-seq_len:]
-        ctx_tensor = Tensor([ctx_ids], dtype=dtypes.int32)
+    token_times_ms = []
+    t_start = time.time()
+    ttft_ms = 0.0
 
-        # Forward pass
-        logits = model.forward(ctx_tensor)
-        logits_np = logits[0, -1, :raw_vocab_size].cast(dtypes.float32).numpy()
+    for step_idx in range(max_new_tokens):
+        t0 = time.time()
+
+        ctx_ids = current_ids[-seq_len:]
+        L = len(ctx_ids)
+
+        x_np = np.zeros((1, seq_len), dtype=np.int32)
+        x_np[0, :L] = ctx_ids
+
+        x_jit.assign(x_np).realize()
+        logits = eval_fn(x_jit).realize()
+        logits_np = logits[0, L - 1, :raw_vocab_size].cast(dtypes.float32).numpy()
 
         next_trimmed_id = sample_next_token(logits_np, temperature=temperature, top_k=top_k)
         current_ids.append(next_trimmed_id)
+
+        t1 = time.time()
+        step_ms = (t1 - t0) * 1000.0
+        token_times_ms.append(step_ms)
+
+        if step_idx == 0:
+            ttft_ms = step_ms
 
         # Stream decoded token to stdout
         if new_to_orig and next_trimmed_id < len(new_to_orig):
@@ -134,6 +169,21 @@ def generate_text(
 
     sys.stdout.write("\n-------------------------------------------------------\n")
     sys.stdout.flush()
+
+    t_end = time.time()
+    total_gen_sec = t_end - t_start
+    gen_tok_per_sec = max_new_tokens / total_gen_sec if total_gen_sec > 0 else 0.0
+    avg_per_token_ms = float(np.mean(token_times_ms[1:])) if len(token_times_ms) > 1 else (float(np.mean(token_times_ms)) if token_times_ms else 0.0)
+
+    if profile:
+        print("\n=======================================================", flush=True)
+        print("⚡ INFERENCE PROFILING TELEMETRY METRICS", flush=True)
+        print("=======================================================", flush=True)
+        print(f"Time To First Token (TTFT): {ttft_ms:.2f} ms", flush=True)
+        print(f"Average Generation Speed:  {gen_tok_per_sec:.1f} tokens/sec", flush=True)
+        print(f"Average Per-Token Latency: {avg_per_token_ms:.2f} ms/token", flush=True)
+        print(f"Total Generation Duration: {total_gen_sec:.2f} s ({max_new_tokens} tokens)", flush=True)
+        print("=======================================================\n", flush=True)
 
     # Full decode
     if new_to_orig:
@@ -153,6 +203,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100, help="Number of new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature (0.0 for greedy)")
     parser.add_argument("--top-k", type=int, default=40, help="Top-k filtering threshold")
+    parser.add_argument("--no-jit", action="store_true", default=False, help="Disable @TinyJit compilation")
+    parser.add_argument("--profile", action="store_true", default=False, help="Enable detailed inference profiling telemetry")
     parser.add_argument("--interactive", action="store_true", default=False, help="Run interactive prompt loop")
     args = parser.parse_args()
 
@@ -167,6 +219,7 @@ def main():
     print("\n=======================================================", flush=True)
     print(f"🚀 TINYGRAD INFERENCE ENGINE ({args.model_size})", flush=True)
     print(f"Checkpoint: {ckpt_path}", flush=True)
+    print(f"JIT Acceleration: {not args.no_jit} | Profiling: {args.profile}", flush=True)
     print("=======================================================\n", flush=True)
 
     # Initialize Tokenizer & Vocab Map
@@ -203,10 +256,12 @@ def main():
 
     # Load parameters from safetensors checkpoint
     print(f"📦 Loading weights from '{ckpt_path}'...", flush=True)
+    t_load_start = time.time()
     state = safe_load(ckpt_path)
     load_state_dict(model, state)
     Tensor.realize(*get_parameters(model))
-    print("✅ Model weights loaded successfully.\n", flush=True)
+    t_load_ms = (time.time() - t_load_start) * 1000.0
+    print(f"✅ Model weights loaded successfully in {t_load_ms:.2f} ms.\n", flush=True)
 
     if args.interactive:
         print("💡 Entering Interactive Generation Mode. Press Ctrl+C or type 'exit' to quit.\n", flush=True)
@@ -226,6 +281,8 @@ def main():
                     max_new_tokens=args.max_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
+                    use_jit=not args.no_jit,
+                    profile=args.profile,
                 )
             except (KeyboardInterrupt, EOFError):
                 print("\nExiting interactive mode.")
@@ -240,6 +297,8 @@ def main():
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            use_jit=not args.no_jit,
+            profile=args.profile,
         )
 
 
