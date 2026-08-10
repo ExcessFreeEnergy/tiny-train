@@ -215,7 +215,7 @@ def main():
         try:
             with open(vocab_map_path) as vf:
                 vdata = json.load(vf)
-                dataset_vocab_size = vdata.get("trimmed_vocab_size", dataset_vocab_size)
+                dataset_vocab_size = vdata.get("active_vocab_size", vdata.get("trimmed_vocab_size", vdata.get("vocab_size", dataset_vocab_size)))
         except Exception:
             pass
 
@@ -236,7 +236,7 @@ def main():
     use_swiglu = bool(config.get("USE_SWIGLU", 1))
     use_rope = bool(config.get("USE_ROPE", 1))
     pad_vocab_mult = int(config.get("PAD_VOCAB_MULTIPLE", 128))
-    pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 1))
+    pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 0))
     use_jit = bool(config.get("JIT", 1))
 
     if os.path.exists(train_bin):
