@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 import tiktoken
-from tinygrad import Tensor, TinyJit, dtypes
+from tinygrad import Tensor, TinyJit, Variable, dtypes
 from tinygrad.device import Device
 from tinygrad.nn.state import get_parameters, load_state_dict, safe_load
 
@@ -104,7 +104,9 @@ def generate_text(
     use_jit: bool = True,
     profile: bool = False,
 ) -> str:
-    """Autoregressively generate text given a starting prompt using @TinyJit static shape acceleration."""
+    """Autoregressively generate text given a starting prompt using KV-caching and @TinyJit acceleration."""
+    model.reset_cache()
+
     orig_prompt_ids = tokenizer.encode(prompt)
     if not orig_prompt_ids:
         orig_prompt_ids = [50256]  # Fallback to EOS
@@ -117,20 +119,19 @@ def generate_text(
     current_ids = list(trimmed_prompt_ids)
     raw_vocab_size = model.raw_vocab_size
 
-    # Static input tensor buffer for JIT compilation
-    x_jit = Tensor.zeros(1, seq_len, dtype=dtypes.int32).realize()
-
-    def eval_step(x_in: Tensor) -> Tensor:
-        return model.forward(x_in)
+    def step_fn(x_in: Tensor, start_pos: Variable) -> Tensor:
+        return model.forward(x_in, start_pos=start_pos)
 
     if use_jit:
-        eval_fn = TinyJit(eval_step)
-        # JIT compilation warmup pass to keep TTFT fast during generation
-        x_jit.assign(np.zeros((1, seq_len), dtype=np.int32)).realize()
-        _ = eval_fn(x_jit).realize()
+        step_jit = TinyJit(step_fn)
+        # JIT compilation warmup pass so kernel compilation finishes before starting timing
+        x_warm = Tensor([[0]], dtype=dtypes.int32).realize()
+        v_warm = Variable("start_pos", 0, 511).bind(0)
+        _ = step_jit(x_warm, v_warm).realize()
         Device[Device.DEFAULT].synchronize()
+        model.reset_cache()
     else:
-        eval_fn = eval_step
+        step_jit = step_fn
 
     print(f'\n📝 Prompt: "{prompt}"', flush=True)
     print("-------------------------------------------------------", flush=True)
@@ -139,30 +140,47 @@ def generate_text(
 
     token_times_ms = []
     t_start = time.time()
-    ttft_ms = 0.0
 
-    for step_idx in range(max_new_tokens):
+    # 1. Prompt Phase (Fill initial KV cache for prompt tokens)
+    t0 = time.time()
+    prompt_len = len(trimmed_prompt_ids)
+    x_prompt = Tensor([trimmed_prompt_ids], dtype=dtypes.int32).realize()
+    v_start_pos_0 = Variable("start_pos", 0, 511).bind(0)
+    logits_prompt = model.forward(x_prompt, start_pos=v_start_pos_0).realize()
+    logits_np = logits_prompt[0, prompt_len - 1, :raw_vocab_size].cast(dtypes.float32).numpy()
+
+    next_trimmed_id = sample_next_token(logits_np, temperature=temperature, top_k=top_k)
+    current_ids.append(next_trimmed_id)
+
+    t1 = time.time()
+    ttft_ms = (t1 - t0) * 1000.0
+    token_times_ms.append(ttft_ms)
+
+    # Stream first generated token
+    if new_to_orig and next_trimmed_id < len(new_to_orig):
+        orig_id = new_to_orig[next_trimmed_id]
+    else:
+        orig_id = next_trimmed_id
+    sys.stdout.write(tokenizer.decode([orig_id]))
+    sys.stdout.flush()
+
+    # 2. Single-token Autoregressive Generation Phase
+    start_pos = prompt_len
+    for step_idx in range(1, max_new_tokens):
         t0 = time.time()
 
-        ctx_ids = current_ids[-seq_len:]
-        L = len(ctx_ids)
-
-        x_np = np.zeros((1, seq_len), dtype=np.int32)
-        x_np[0, :L] = ctx_ids
-
-        x_jit.assign(x_np).realize()
-        logits = eval_fn(x_jit).realize()
-        logits_np = logits[0, L - 1, :raw_vocab_size].cast(dtypes.float32).numpy()
+        x_in = Tensor([[next_trimmed_id]], dtype=dtypes.int32).realize()
+        v_start_pos = Variable("start_pos", 0, 511).bind(start_pos)
+        logits = step_jit(x_in, v_start_pos).realize()
+        logits_np = logits[0, 0, :raw_vocab_size].cast(dtypes.float32).numpy()
 
         next_trimmed_id = sample_next_token(logits_np, temperature=temperature, top_k=top_k)
         current_ids.append(next_trimmed_id)
+        start_pos += 1
 
         t1 = time.time()
         step_ms = (t1 - t0) * 1000.0
         token_times_ms.append(step_ms)
-
-        if step_idx == 0:
-            ttft_ms = step_ms
 
         # Stream decoded token to stdout
         if new_to_orig and next_trimmed_id < len(new_to_orig):
@@ -192,7 +210,6 @@ def generate_text(
         print(f"Total Generation Duration: {total_gen_sec:.2f} s ({max_new_tokens} tokens)", flush=True)
         print("=======================================================\n", flush=True)
 
-    # Full decode
     if new_to_orig:
         full_orig_ids = [new_to_orig[tid] for tid in current_ids if tid < len(new_to_orig)]
     else:
@@ -266,7 +283,7 @@ def main():
     print(f"📦 Loading weights from '{ckpt_path}'...", flush=True)
     t_load_start = time.time()
     state = safe_load(ckpt_path)
-    load_state_dict(model, state)
+    load_state_dict(model, state, strict=False)
     Tensor.realize(*get_parameters(model))
     t_load_ms = (time.time() - t_load_start) * 1000.0
     print(f"✅ Model weights loaded successfully in {t_load_ms:.2f} ms.\n", flush=True)

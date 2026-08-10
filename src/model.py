@@ -3,7 +3,7 @@ model.py - High-Performance Transformer Architecture for tinygrad.
 Supports Tensor Core alignment, Fused RoPE, RMSNorm, FlashAttention SDPA, and SwiGLU.
 """
 
-from tinygrad import Tensor, dtypes, nn
+from tinygrad import Tensor, Variable, dtypes, nn
 
 
 def pad_vocab_size(vocab_size: int, multiple: int = 128, power_of_two: bool = False) -> int:
@@ -41,7 +41,7 @@ class CausalSelfAttention:
         self.c_attn = Tensor.glorot_uniform(d_model, 3 * d_model)
         self.c_proj = Tensor.glorot_uniform(d_model, d_model)
 
-    def __call__(self, x: Tensor, freqs_cis: Tensor | None = None) -> Tensor:
+    def __call__(self, x: Tensor, freqs_cis: Tensor | None = None, start_pos: int | None = None) -> Tensor:
         b, t, c = x.shape
         qkv = x @ self.c_attn
         q, k, v = qkv.chunk(3, dim=-1)
@@ -49,14 +49,35 @@ class CausalSelfAttention:
         k = k.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        if self.use_rope and freqs_cis is not None:
-            q = apply_rope(q, freqs_cis)
-            k = apply_rope(k, freqs_cis)
+        if start_pos is None:
+            if self.use_rope and freqs_cis is not None:
+                q = apply_rope(q, freqs_cis[:t])
+                k = apply_rope(k, freqs_cis[:t])
+            y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            if self.use_rope and freqs_cis is not None:
+                freqs = freqs_cis[start_pos : start_pos + t]
+                q = apply_rope(q, freqs)
+                k = apply_rope(k, freqs)
 
-        # Fused Scaled Dot-Product Attention (SDPA / FlashAttention)
-        y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
+            if not hasattr(self, "cache_kv"):
+                max_context = freqs_cis.shape[0] if freqs_cis is not None else 512
+                self.cache_kv = Tensor.zeros(2, b, self.n_heads, max_context, self.head_dim, dtype=k.dtype).contiguous().realize()
+
+            kv_stacked = Tensor.stack(k, v).cast(self.cache_kv.dtype)
+            self.cache_kv[:, :, :, start_pos : start_pos + t, :].assign(kv_stacked).realize()
+            keys = self.cache_kv[0][:, :, : start_pos + t, :]
+            values = self.cache_kv[1][:, :, : start_pos + t, :]
+
+            mask = Tensor.full((1, 1, t, start_pos + t), float("-inf"), dtype=x.dtype).triu(start_pos + 1) if t > 1 else None
+            y = Tensor.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
+
         y = y.transpose(1, 2).reshape(b, t, c)
         return y @ self.c_proj
+
+    def reset_cache(self):
+        if hasattr(self, "cache_kv"):
+            del self.cache_kv
 
 
 class GELUMLP:
@@ -92,10 +113,13 @@ class Block:
         self.rms_2 = nn.RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, d_ff) if use_swiglu else GELUMLP(d_model, d_ff)
 
-    def __call__(self, x: Tensor, freqs_cis: Tensor | None = None) -> Tensor:
-        x = x + self.attn(self.rms_1(x), freqs_cis=freqs_cis)
+    def __call__(self, x: Tensor, freqs_cis: Tensor | None = None, start_pos: int | None = None) -> Tensor:
+        x = x + self.attn(self.rms_1(x), freqs_cis=freqs_cis, start_pos=start_pos)
         x = x + self.mlp(self.rms_2(x))
         return x
+
+    def reset_cache(self):
+        self.attn.reset_cache()
 
 
 class GPT:
@@ -130,15 +154,22 @@ class GPT:
         self.h = [Block(d_model, n_heads, d_ff, use_swiglu=use_swiglu, use_rope=use_rope) for _ in range(n_layers)]
         self.rms_f = nn.RMSNorm(d_model)
 
-    def forward(self, idx: Tensor) -> Tensor:
+    def reset_cache(self):
+        for block in self.h:
+            block.reset_cache()
+
+    def forward(self, idx: Tensor, start_pos: int | None = None) -> Tensor:
         b, t = idx.shape
         x = self.wte[idx]
         if not self.use_rope:
-            pos = Tensor.arange(0, t, dtype=dtypes.int32)
+            if start_pos is not None:
+                pos = Tensor.arange(0, t, dtype=dtypes.int32) + start_pos
+            else:
+                pos = Tensor.arange(0, t, dtype=dtypes.int32)
             x = x + self.wpe[pos]
 
         for block in self.h:
-            x = block(x, freqs_cis=self.freqs_cis)
+            x = block(x, freqs_cis=self.freqs_cis, start_pos=start_pos)
 
         x = self.rms_f(x)
         logits = x @ self.wte.T
