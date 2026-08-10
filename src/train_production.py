@@ -156,7 +156,9 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500, help="Total training steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-interval", type=int, default=50, help="Steps between validation evaluations")
+    parser.add_argument("--patience", type=int, default=4, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
+    parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb"], default=None, help="Dataset to train on (tinystories or fineweb)")
     parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
@@ -168,6 +170,8 @@ def main():
         os.environ["DEBUG"] = "0"
 
     config = load_config(args.config)
+
+    dataset_name = (args.dataset or config.get("DATASET", "tinystories")).lower()
 
     beam_val = str(config.get("BEAM", 2))
     os.environ["BEAM"] = os.environ.get("BEAM", beam_val)
@@ -187,19 +191,43 @@ def main():
     grad_accum_steps = int(config.get("GRAD_ACCUMULATION_STEPS", 4))
     eff_batch_size = micro_batch_size * grad_accum_steps
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
-    max_lr = float(config.get("LEARNING_RATE", 1e-3))
+    max_lr = float(config.get("LEARNING_RATE", 4e-4))
     min_lr = max_lr * 0.1
     warmup_iters = max(10, int(args.total_steps * 0.05))
 
+    # Determine Dataset Paths
+    if dataset_name == "fineweb":
+        data_dir = "data/FineWeb"
+    else:
+        data_dir = "data/TinyStories"
+
+    train_bin = os.path.join(data_dir, "train_trimmed.bin")
+    valid_bin = os.path.join(data_dir, "valid_trimmed.bin")
+    if not os.path.exists(train_bin):
+        train_bin = os.path.join(data_dir, "train.bin")
+    if not os.path.exists(valid_bin):
+        valid_bin = os.path.join(data_dir, "valid.bin")
+
+    # Load Vocab Map if available in dataset directory
+    vocab_map_path = os.path.join(data_dir, "vocab_map.json")
+    dataset_vocab_size = int(config.get("VOCAB_SIZE", 13970))
+    if os.path.exists(vocab_map_path):
+        try:
+            with open(vocab_map_path) as vf:
+                vdata = json.load(vf)
+                dataset_vocab_size = vdata.get("trimmed_vocab_size", dataset_vocab_size)
+        except Exception:
+            pass
+
     # Model Presets
     if args.model_size == "125M":
-        vocab_size = int(config.get("VOCAB_SIZE", 13970))
+        vocab_size = dataset_vocab_size
         d_model = 768
         n_layers = 12
         n_heads = 12
         d_ff = 3072
     else:
-        vocab_size = int(config.get("VOCAB_SIZE", 13970))
+        vocab_size = dataset_vocab_size
         d_model = 288
         n_layers = 6
         n_heads = 6
@@ -211,16 +239,11 @@ def main():
     pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 1))
     use_jit = bool(config.get("JIT", 1))
 
-    train_bin = "data/TinyStories/train_trimmed.bin"
-    valid_bin = "data/TinyStories/valid_trimmed.bin"
-    if not os.path.exists(train_bin):
-        train_bin = "data/TinyStories/train.bin"
-
     if os.path.exists(train_bin):
-        print(f"📦 Loading training dataset: '{train_bin}'", flush=True)
+        print(f"📦 Loading training dataset ({dataset_name}): '{train_bin}'", flush=True)
         train_data = np.memmap(train_bin, dtype=np.uint16, mode="r")
     else:
-        print("⚠️ Training binary dataset not found. Using synthetic random buffer...", flush=True)
+        print(f"⚠️ Training binary dataset '{train_bin}' not found. Using synthetic random buffer...", flush=True)
         train_data = np.random.randint(0, vocab_size, size=(10000000,), dtype=np.uint16)
 
     if os.path.exists(valid_bin):
@@ -413,6 +436,8 @@ def main():
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     step_times = []
     last_loss_val = 0.0
+    best_val_loss = float("inf")
+    patience_counter = 0
 
     # Production Training Loop
     for step in range(start_step, args.total_steps + 1):
@@ -485,6 +510,23 @@ def main():
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")
             save_checkpoint(model, optimizer, step, ckpt_path, master_params=master_params)
             print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
+
+            if args.patience > 0:
+                if val_loss < best_val_loss - 1e-4:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    print(
+                        f"⚠️ Validation loss did not improve (best: {best_val_loss:.4f}). Early stopping patience: {patience_counter}/{args.patience}",
+                        flush=True,
+                    )
+                    if patience_counter >= args.patience:
+                        print(
+                            f"🛑 Early stopping triggered at step {step}: Validation loss failed to improve for {args.patience} consecutive evaluations.",
+                            flush=True,
+                        )
+                        break
 
     avg_step_ms = float(np.mean(step_times[1:])) if len(step_times) > 1 else (float(np.mean(step_times)) if step_times else 0.0)
     avg_tput = eff_batch_size / (avg_step_ms / 1000.0) if avg_step_ms > 0 else 0.0

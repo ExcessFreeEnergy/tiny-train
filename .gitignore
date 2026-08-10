@@ -35,4 +35,5 @@ checkpoints_run_*/
 
 # Logs & execution traces
 *.log
+logs/
 

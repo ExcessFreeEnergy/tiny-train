@@ -34,10 +34,17 @@ from tinygrad.nn.state import get_parameters, load_state_dict, safe_load
 from src.model import GPT
 
 
-def load_vocab_map(vocab_map_path: str = "data/TinyStories/vocab_map.json"):
+def load_vocab_map(dataset_name: str = "tinystories", vocab_map_path: str | None = None):
     """Load vocabulary map for trimming/restoring original GPT-2 token IDs."""
+    if not vocab_map_path:
+        if dataset_name.lower() == "fineweb":
+            vocab_map_path = "data/FineWeb/vocab_map.json"
+        else:
+            vocab_map_path = "data/TinyStories/vocab_map.json"
+
     if not os.path.exists(vocab_map_path):
-        vocab_map_path = os.path.join(os.path.dirname(__file__), "data/TinyStories/vocab_map.json")
+        vocab_map_path = os.path.join(os.path.dirname(__file__), vocab_map_path)
+
     if os.path.exists(vocab_map_path):
         with open(vocab_map_path) as f:
             vmap = json.load(f)
@@ -196,6 +203,7 @@ def generate_text(
 
 def main():
     parser = argparse.ArgumentParser(description="TinyGrad Transformer Inference & Generation Engine")
+    parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb"], default="tinystories", help="Target dataset (tinystories or fineweb)")
     parser.add_argument("--model-size", choices=["15M", "125M"], default="125M", help="Target model scale")
     parser.add_argument("--checkpoint", type=str, default=None, help="Explicit path to .safetensors checkpoint file")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory containing model checkpoints")
@@ -217,14 +225,14 @@ def main():
         raise FileNotFoundError(f"No valid checkpoint found for model scale '{args.model_size}' in directory '{args.checkpoint_dir}'.")
 
     print("\n=======================================================", flush=True)
-    print(f"🚀 TINYGRAD INFERENCE ENGINE ({args.model_size})", flush=True)
+    print(f"🚀 TINYGRAD INFERENCE ENGINE ({args.model_size} | Dataset: {args.dataset})", flush=True)
     print(f"Checkpoint: {ckpt_path}", flush=True)
     print(f"JIT Acceleration: {not args.no_jit} | Profiling: {args.profile}", flush=True)
     print("=======================================================\n", flush=True)
 
     # Initialize Tokenizer & Vocab Map
     tokenizer = tiktoken.get_encoding("gpt2")
-    orig_to_new, new_to_orig = load_vocab_map()
+    orig_to_new, new_to_orig = load_vocab_map(dataset_name=args.dataset)
 
     # Model Preset Architecture Parameters
     if args.model_size == "125M":

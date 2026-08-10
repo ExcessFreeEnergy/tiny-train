@@ -38,7 +38,7 @@ def load_config(config_path: str | None = None) -> dict:
             "PAD_VOCAB_MULTIPLE": 128,
             "PAD_VOCAB_POWER_OF_2": 1,
             "SEQUENCE_LENGTH": 256,
-            "LEARNING_RATE": 1e-3,
+            "LEARNING_RATE": 4e-4,
             "NUM_STEPS": 20,
             "VOCAB_SIZE": 13970,
             "D_MODEL": 768,
@@ -178,6 +178,8 @@ def run_harness(
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "train_production.py")
     num_steps = str(config.get("NUM_STEPS", 10))
     cmd = [sys.executable, script_path, "--model-size", "125M", "--total-steps", num_steps, "--config", config_path]
+    if "DATASET" in config:
+        cmd.extend(["--dataset", str(config["DATASET"])])
     if env["DEBUG"] == "0":
         cmd.append("--disable-debug")
     print(f"\nExecuting payload: {' '.join(cmd)}")
