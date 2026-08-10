@@ -337,19 +337,19 @@ def main():
     x_jit = Tensor.zeros(micro_batch_size, seq_len, dtype=dtypes.int32, device=params[0].device).realize()
     y_jit = Tensor.zeros(micro_batch_size, seq_len, dtype=dtypes.int32, device=params[0].device).realize()
 
-    def accum_step(x_micro: Tensor, y_micro: Tensor) -> Tensor:
+    def accum_step(x_micro: Tensor, y_micro: Tensor):
         logits_chunk = model.forward(x_micro)
         flat_logits = logits_chunk.reshape(-1, logits_chunk.shape[-1])
         flat_y = y_micro.flatten()
         chunk_loss = flat_logits.sparse_categorical_crossentropy(flat_y) / grad_accum_steps
         scaled_loss = chunk_loss * loss_scale
         scaled_loss.backward()
+        accum_nodes = []
         for p in params:
             if p.grad is not None:
-                # Statically accumulate and sever the graph
-                p.accum_grad.assign(p.accum_grad + p.grad.cast(p.accum_grad.dtype))
+                accum_nodes.append(p.accum_grad.assign(p.accum_grad + p.grad.cast(p.accum_grad.dtype)))
                 p.grad = None  # Force backward() to create a fresh leaf node next iteration
-        return chunk_loss
+        return chunk_loss, *accum_nodes
 
     def opt_step():
         # Global FP32 L2 Gradient Norm Clipping
@@ -365,12 +365,12 @@ def main():
         sync_nodes = [p.assign(master_p.cast(p.dtype)) for p, master_p in zip(params, master_params)]
         wipe_nodes = [p.accum_grad.assign(Tensor.zeros_like(p.accum_grad)) for p in params]
 
-        Tensor.realize(*opt_nodes, *sync_nodes, *wipe_nodes)
-
         for master_p in master_params:
             master_p.grad = None
         for p in params:
             p.grad = None
+
+        return *opt_nodes, *sync_nodes, *wipe_nodes
 
     # Wrap in TinyJit
     if use_jit:
@@ -383,14 +383,15 @@ def main():
     # 4. Proceed with JIT warmup to trigger actual kernel compilation
     sys.stderr.write("[train_production.py] Running JIT compilation warmup steps...\n")
     w_start = time.time()
-    w_last_loss = None
     for w in range(2):
         xw, yw = get_batch(train_data, 100 + w)
+        w_last_loss = None
         for i in range(grad_accum_steps):
             x_jit.assign(xw[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
             y_jit.assign(yw[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
-            w_last_loss = accum_fn(x_jit, y_jit)
-        opt_fn()
+            w_res = accum_fn(x_jit, y_jit)
+            w_last_loss = w_res[0]
+        _ = opt_fn()
         Device[Device.DEFAULT].synchronize()
         if w_last_loss is not None:
             w_loss_val = float(w_last_loss.cast(dtypes.float).item())
@@ -426,10 +427,11 @@ def main():
             for i in range(grad_accum_steps):
                 x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
                 y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
-                loss_micro = accum_fn(x_jit, y_jit)
+                res_micro = accum_fn(x_jit, y_jit)
+                loss_micro = res_micro[0]
                 step_loss_tensor.assign(step_loss_tensor + loss_micro).realize()
 
-            opt_fn()
+            _ = opt_fn()
             Device[Device.DEFAULT].synchronize()
             step_loss = float(step_loss_tensor.cast(dtypes.float).item())
         except Exception as step_err:
@@ -450,9 +452,10 @@ def main():
             for i in range(grad_accum_steps):
                 x_jit.assign(x_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
                 y_jit.assign(y_b[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
-                loss_micro = accum_fn(x_jit, y_jit)
+                res_micro = accum_fn(x_jit, y_jit)
+                loss_micro = res_micro[0]
                 step_loss_tensor.assign(step_loss_tensor + loss_micro).realize()
-            opt_fn()
+            _ = opt_fn()
             Device[Device.DEFAULT].synchronize()
             step_loss = float(step_loss_tensor.cast(dtypes.float).item())
 
