@@ -1,9 +1,9 @@
 """
 model.py - High-Performance Transformer Architecture for tinygrad.
-Supports Tensor Core 64/128 alignment, Fused RoPE, RMSNorm, FlashAttention SDPA, and SwiGLU.
+Supports Tensor Core alignment, Fused RoPE, RMSNorm, FlashAttention SDPA, and SwiGLU.
 """
 
-from tinygrad import Tensor, dtypes
+from tinygrad import Tensor, dtypes, nn
 
 
 def pad_vocab_size(vocab_size: int, multiple: int = 128, power_of_two: bool = False) -> int:
@@ -16,34 +16,19 @@ def pad_vocab_size(vocab_size: int, multiple: int = 128, power_of_two: bool = Fa
     return ((vocab_size + multiple - 1) // multiple) * multiple
 
 
-def precompute_freqs_cis(dim: int, max_len: int = 2048) -> tuple[Tensor, Tensor]:
-    """Precompute static RoPE cos and sin buffers up to max_len."""
-    inv_freq = 1.0 / (10000.0 ** (Tensor.arange(0, dim, 2, dtype=dtypes.float) / dim))
-    t_pos = Tensor.arange(0, max_len, dtype=dtypes.float)
-    freqs = t_pos.reshape(max_len, 1) * inv_freq.reshape(1, dim // 2)
-    emb = Tensor.cat(freqs, freqs, dim=-1).reshape(1, 1, max_len, dim)
-    return emb.cos().cast(dtypes.default_float).realize(), emb.sin().cast(dtypes.default_float).realize()
+def precompute_freqs_cis(dim: int, max_len: int = 2048, theta: float = 10000.0) -> Tensor:
+    """Precompute static RoPE cos/sin buffer up to max_len matching tinygrad LLM conventions."""
+    freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2, dtype=dtypes.float) / dim))
+    freqs = Tensor.arange(max_len, dtype=dtypes.float).unsqueeze(1) * freqs.unsqueeze(0)
+    return freqs.cos().cat(freqs.sin(), dim=-1).cast(dtypes.default_float).is_param_(False)
 
 
-def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+def apply_rope(x: Tensor, freqs_cis: Tensor) -> Tensor:
     """Apply precomputed Rotary Position Embeddings (RoPE) to Query or Key tensor."""
     b, h, t, d = x.shape
-    c, s = cos[:, :, :t, :], sin[:, :, :t, :]
-    x1 = x[:, :, :, : d // 2]
-    x2 = x[:, :, :, d // 2 :]
-    x_rot = Tensor.cat(-x2, x1, dim=-1)
-    return x * c + x_rot * s
-
-
-class RMSNorm:
-    """Root Mean Square Layer Normalization (fuses into single-pass reduction)."""
-
-    def __init__(self, dim: int, eps: float = 1e-5):
-        self.weight = Tensor.ones(dim)
-        self.eps = eps
-
-    def __call__(self, x: Tensor) -> Tensor:
-        return (x * (x.pow(2).mean(-1, keepdim=True) + self.eps).rsqrt()) * self.weight
+    cos, sin = freqs_cis[:t].reshape(1, 1, t, d).chunk(2, dim=-1)
+    x1, x2 = x.chunk(2, dim=-1)
+    return (x1 * cos - x2 * sin).cat(x2 * cos + x1 * sin, dim=-1)
 
 
 class CausalSelfAttention:
@@ -56,7 +41,7 @@ class CausalSelfAttention:
         self.c_attn = Tensor.glorot_uniform(d_model, 3 * d_model)
         self.c_proj = Tensor.glorot_uniform(d_model, d_model)
 
-    def __call__(self, x: Tensor, cos: Tensor = None, sin: Tensor = None) -> Tensor:
+    def __call__(self, x: Tensor, freqs_cis: Tensor | None = None) -> Tensor:
         b, t, c = x.shape
         qkv = x @ self.c_attn
         q, k, v = qkv.chunk(3, dim=-1)
@@ -64,9 +49,9 @@ class CausalSelfAttention:
         k = k.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
         v = v.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
 
-        if self.use_rope and cos is not None and sin is not None:
-            q = apply_rope(q, cos, sin)
-            k = apply_rope(k, cos, sin)
+        if self.use_rope and freqs_cis is not None:
+            q = apply_rope(q, freqs_cis)
+            k = apply_rope(k, freqs_cis)
 
         # Fused Scaled Dot-Product Attention (SDPA / FlashAttention)
         y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -102,13 +87,13 @@ class Block:
     """Transformer Block with Pre-RMSNorm and Pre-Attention Residuals."""
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int, use_swiglu: bool = False, use_rope: bool = True):
-        self.rms_1 = RMSNorm(d_model)
+        self.rms_1 = nn.RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, use_rope=use_rope)
-        self.rms_2 = RMSNorm(d_model)
+        self.rms_2 = nn.RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, d_ff) if use_swiglu else GELUMLP(d_model, d_ff)
 
-    def __call__(self, x: Tensor, cos: Tensor = None, sin: Tensor = None) -> Tensor:
-        x = x + self.attn(self.rms_1(x), cos=cos, sin=sin)
+    def __call__(self, x: Tensor, freqs_cis: Tensor | None = None) -> Tensor:
+        x = x + self.attn(self.rms_1(x), freqs_cis=freqs_cis)
         x = x + self.mlp(self.rms_2(x))
         return x
 
@@ -137,13 +122,13 @@ class GPT:
 
         self.wte = Tensor.glorot_uniform(self.vocab_size, d_model)
         if use_rope:
-            self.cos, self.sin = precompute_freqs_cis(d_model // n_heads, max_len=max_len)
+            self.freqs_cis = precompute_freqs_cis(d_model // n_heads, max_len=max_len).is_param_(False)
         else:
             self.wpe = Tensor.glorot_uniform(max_len, d_model)
-            self.cos, self.sin = None, None
+            self.freqs_cis = None
 
         self.h = [Block(d_model, n_heads, d_ff, use_swiglu=use_swiglu, use_rope=use_rope) for _ in range(n_layers)]
-        self.rms_f = RMSNorm(d_model)
+        self.rms_f = nn.RMSNorm(d_model)
 
     def forward(self, idx: Tensor) -> Tensor:
         b, t = idx.shape
@@ -153,17 +138,14 @@ class GPT:
             x = x + self.wpe[pos]
 
         for block in self.h:
-            x = block(x, cos=self.cos, sin=self.sin)
+            x = block(x, freqs_cis=self.freqs_cis)
 
         x = self.rms_f(x)
         logits = x @ self.wte.T
         return logits
 
     def num_params(self) -> int:
-        from tinygrad.nn.state import get_state_dict
-
-        state = get_state_dict(self)
-        return sum(p.numel() for p in state.values())
+        return sum(p.numel() for p in nn.state.get_parameters(self))
 
 
 if __name__ == "__main__":

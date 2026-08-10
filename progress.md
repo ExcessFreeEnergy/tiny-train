@@ -15,6 +15,8 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | 🛠️ **tinygrad Run 41 (Post-Bugfix)** | **125M** | **`@TinyJit` + BEAM=2** | **40.47s** | **361.30 ms** | **354.3** | **68.52 TFLOPS** | **20.76%** | **9.7500** |
 | 🌐 **tinygrad FineWeb 1B (seq_len=256)** | **125M (151.6M)** | **`@TinyJit` + BEAM=2** | **152.66s** | **747.18 ms** | **171.3** | **39.88 TFLOPS** | **12.09%** | **7.7500** |
 | 📖 **tinygrad FineWeb 1k Context (seq_len=1024)** | **125M (151.6M)** | **`@TinyJit` + BEAM=2** | **408.19s** | **3,593.21 ms** | **35.6** | **33.19 TFLOPS** | **10.06%** | **8.0000** |
+| ✨ **tinygrad Best Practice Refactor (BS=8, GA=16)** | **125M (151.6M)** | **Clean `@TinyJit` + BEAM=2** | **32.41s** | **3,460.07 ms** | **37.0** | **34.45 TFLOPS** | **10.44%** | **8.0000** |
+| 🧪 **tinygrad Microbatch Sweep (BS=16, GA=8)** | **125M (151.6M)** | **Clean `@TinyJit` + BEAM=2** | **2,010.41s** | **4,024.67 ms** | **31.8** | **29.62 TFLOPS** | **8.97%** | **8.0000** |
 | **PyTorch Default** | 125M | `torch.compile` | 3.7s | 159.33 ms | 401.7 | 83.83 TFLOPS | 25.40% | 5.9404 |
 | **PyTorch Autotune 125M** | 125M | `max-autotune` | 21.8s | 271.91 ms | 235.4 | 98.25 TFLOPS | 29.77% | 6.0209 |
 | **PyTorch 350M Scale** | 350M | `reduce-overhead` | 25.2s | 237.70 ms | 33.7 | 103.03 TFLOPS | 31.22% | 7.3492 |
@@ -58,7 +60,6 @@ This document tracks cumulative performance benchmarks, architectural refactorin
   "D_FF": 3072
 }
 ```
-
 
 ---
 
@@ -106,4 +107,5 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 13. **Long Context Scaling (`seq_len=1024`, 131k Tokens/Step)**:
     Benchmarked 1k context window scaling (`seq_len=1024`, `micro_batch=8`, `grad_accum=16`), processing **131,072 tokens per optimizer step** at **36,476 tok/sec** (33.19 TFLOPS). Empirical 1B token FineWeb training time: **~6.3 hours** at `seq_len=256` and **~7.6 hours** at `seq_len=1024`.
 
-
+14. **Canonical Tinygrad Best-Practice Architecture & JIT Refactoring**:
+    Refactored model and training engine to match canonical tinygrad forms from `examples/transformer.py` and `tinygrad/llm/model.py`. Adopted `tinygrad.nn.RMSNorm`, refactored RoPE to chunked half-split layout (`freqs_cis[:t].chunk(2, dim=-1)`), marked static position tables with `.is_param_(False)`, and split training execution into clean microbatch gradient accumulation (`accum_fn`) and optimizer update (`opt_fn`) `@TinyJit` functions. Eliminated manual FP32 `master_params` list synchronization and static buffer `.assign()` overhead, reducing BEAM=2 JIT compilation warmup to **32.41s** (a **12.6x JIT warmup speedup** over unrolled 1k context graph) with 37,817 tok/sec throughput and **10.44% MFU**.
