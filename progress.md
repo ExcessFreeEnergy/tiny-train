@@ -13,6 +13,8 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | 🚀 **tinygrad Post-Audit Winner** | **125M** | **`@TinyJit` + BEAM=2** | **36.42s** | **208.95 ms** | **76.6** | **59.17 TFLOPS** | **17.93%** | **6.1562** |
 | ⚡ **tinygrad Harness Suite (BEAM=4)** | **125M** | **`@TinyJit` + BEAM=4** | **100.45s** | **-** | **-** | **87.02 TFLOPS** | **26.37%** | **N/A (3-step suite)** |
 | 🛠️ **tinygrad Run 41 (Post-Bugfix)** | **125M** | **`@TinyJit` + BEAM=2** | **40.47s** | **361.30 ms** | **354.3** | **68.52 TFLOPS** | **20.76%** | **9.7500** |
+| 🌐 **tinygrad FineWeb 1B (seq_len=256)** | **125M (151.6M)** | **`@TinyJit` + BEAM=2** | **152.66s** | **747.18 ms** | **171.3** | **39.88 TFLOPS** | **12.09%** | **7.7500** |
+| 📖 **tinygrad FineWeb 1k Context (seq_len=1024)** | **125M (151.6M)** | **`@TinyJit` + BEAM=2** | **408.19s** | **3,593.21 ms** | **35.6** | **33.19 TFLOPS** | **10.06%** | **8.0000** |
 | **PyTorch Default** | 125M | `torch.compile` | 3.7s | 159.33 ms | 401.7 | 83.83 TFLOPS | 25.40% | 5.9404 |
 | **PyTorch Autotune 125M** | 125M | `max-autotune` | 21.8s | 271.91 ms | 235.4 | 98.25 TFLOPS | 29.77% | 6.0209 |
 | **PyTorch 350M Scale** | 350M | `reduce-overhead` | 25.2s | 237.70 ms | 33.7 | 103.03 TFLOPS | 31.22% | 7.3492 |
@@ -91,5 +93,17 @@ This document tracks cumulative performance benchmarks, architectural refactorin
    - **FP32 Shadow Weights & JIT Node Realization**: Maintained native `BFLOAT16` parameters in `model.py` to prevent HBM memory bandwidth doubling while creating detached FP32 `master_params` in `train_production.py`. Updated `opt_step()` to realize all nodes simultaneously (`Tensor.realize(*opt_nodes, *sync_nodes, *wipe_nodes)`), ensuring `@TinyJit` captures the optimizer update, shadow-to-model sync, and gradient wipe within the JIT graph.
    - **Asynchronous Loss Accumulation**: Replaced lazy unrolled addition graphs with asynchronous in-loop realization (`step_loss_tensor.assign(step_loss_tensor + loss_micro).realize()`), avoiding GPU memory unrolling while preventing CPU pipeline stalls.
    - **Validation Tensor Sequence Alignment**: Flattened 3D validation logits `[B, T, V]` to 2D `[B*T, V]` and target labels to 1D `[B*T]`, resolving sequence broadcasting mismatches and restoring valid evaluation loss metrics (**9.7500** at step 3 on 125M).
+
+10. **FineWeb 1B Dataset Pipeline & Dynamic Dataset Switch**:
+    Added `--dataset {tinystories,fineweb}` CLI argument and configuration parameter across trainer, harness, and run scripts. Built `src/prepare_fineweb.py` to download `HuggingFaceFW/fineweb` (`sample-10BT` subset) parquet shards, tokenizing 1.447B raw tokens into `train_trimmed.bin` (1B tokens) and `valid_trimmed.bin` (5M tokens) using Gigatoken at 134 Mtok/sec. Byte-level Shannon entropy (6.598 bits) and LZ compression ratio (0.704) confirmed high information density suited for 125M+ parameter models.
+
+11. **Over-Padded Vocabulary Removal (43.5x Logit Reduction Speedup)**:
+    Replaced power-of-two vocabulary padding (`65,536`) with a clean multiple of 128 (`49,792`), eliminating **12.09 Million unnecessary parameters** (reducing model size from 163.66M to **151.57M**). Logit reduction kernel latency (`E_8192`) dropped from **3.48 ms down to 0.08 ms** (**43.5x speedup** on logit reduction and cross-entropy loss computation), boosting training throughput from 41,323 tok/sec to **43,936 tok/sec**.
+
+12. **Redundant Weight Transpose Allocation Removal**:
+    Removed redundant `.contiguous()` allocation on transposed embedding weights (`logits = x @ self.wte.T`), reducing JIT compilation warmup time from **255.13s to 152.66s** (a **102.5s JIT compilation speedup**).
+
+13. **Long Context Scaling (`seq_len=1024`, 131k Tokens/Step)**:
+    Benchmarked 1k context window scaling (`seq_len=1024`, `micro_batch=8`, `grad_accum=16`), processing **131,072 tokens per optimizer step** at **36,476 tok/sec** (33.19 TFLOPS). Empirical 1B token FineWeb training time: **~6.3 hours** at `seq_len=256` and **~7.6 hours** at `seq_len=1024`.
 
 
