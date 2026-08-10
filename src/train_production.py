@@ -110,13 +110,13 @@ def load_checkpoint(model: GPT, optimizer: OptimizerGroup, ckpt_path: str, maste
 
     opt_decay, opt_nodecay = optimizer.optimizers[0], optimizer.optimizers[1]
     if "opt.decay.b1_t" in state:
-        opt_decay.b1_t.assign(state["opt.decay.b1_t"].to(opt_decay.b1_t.device))
+        opt_decay.b1_t.assign(state["opt.decay.b1_t"].cast(opt_decay.b1_t.dtype).to(opt_decay.b1_t.device))
     if "opt.decay.b2_t" in state:
-        opt_decay.b2_t.assign(state["opt.decay.b2_t"].to(opt_decay.b2_t.device))
+        opt_decay.b2_t.assign(state["opt.decay.b2_t"].cast(opt_decay.b2_t.dtype).to(opt_decay.b2_t.device))
     if "opt.nodecay.b1_t" in state:
-        opt_nodecay.b1_t.assign(state["opt.nodecay.b1_t"].to(opt_nodecay.b1_t.device))
+        opt_nodecay.b1_t.assign(state["opt.nodecay.b1_t"].cast(opt_nodecay.b1_t.dtype).to(opt_nodecay.b1_t.device))
     if "opt.nodecay.b2_t" in state:
-        opt_nodecay.b2_t.assign(state["opt.nodecay.b2_t"].to(opt_nodecay.b2_t.device))
+        opt_nodecay.b2_t.assign(state["opt.nodecay.b2_t"].cast(opt_nodecay.b2_t.dtype).to(opt_nodecay.b2_t.device))
 
     restored_buffers = 0
     for opt in optimizer.optimizers:
@@ -126,8 +126,8 @@ def load_checkpoint(model: GPT, optimizer: OptimizerGroup, ckpt_path: str, maste
                 m_key = f"opt.m.{param_key}"
                 v_key = f"opt.v.{param_key}"
                 if m_key in state and v_key in state:
-                    opt.m[i].assign(state[m_key].to(opt.m[i].device))
-                    opt.v[i].assign(state[v_key].to(opt.v[i].device))
+                    opt.m[i].assign(state[m_key].cast(opt.m[i].dtype).to(opt.m[i].device))
+                    opt.v[i].assign(state[v_key].cast(opt.v[i].dtype).to(opt.v[i].device))
                     restored_buffers += 1
 
     if restored_buffers > 0:
@@ -347,7 +347,7 @@ def main():
         for p in params:
             if p.grad is not None:
                 # Statically accumulate and sever the graph
-                p.accum_grad.assign(p.accum_grad + p.grad)
+                p.accum_grad.assign(p.accum_grad + p.grad.cast(p.accum_grad.dtype))
                 p.grad = None  # Force backward() to create a fresh leaf node next iteration
         return chunk_loss
 
@@ -383,14 +383,19 @@ def main():
     # 4. Proceed with JIT warmup to trigger actual kernel compilation
     sys.stderr.write("[train_production.py] Running JIT compilation warmup steps...\n")
     w_start = time.time()
+    w_last_loss = None
     for w in range(2):
         xw, yw = get_batch(train_data, 100 + w)
         for i in range(grad_accum_steps):
             x_jit.assign(xw[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
             y_jit.assign(yw[i * micro_batch_size : (i + 1) * micro_batch_size]).realize()
-            _ = accum_fn(x_jit, y_jit)
+            w_last_loss = accum_fn(x_jit, y_jit)
         opt_fn()
         Device[Device.DEFAULT].synchronize()
+        if w_last_loss is not None:
+            w_loss_val = float(w_last_loss.cast(dtypes.float).item())
+            if math.isnan(w_loss_val) or math.isinf(w_loss_val):
+                raise RuntimeError(f"JIT warmup step {w + 1} produced invalid loss: {w_loss_val}")
 
     # Reset buffer memory contents to exact checkpoint values after JIT allocation trace
     if ckpt_path_to_load:
@@ -428,6 +433,10 @@ def main():
             Device[Device.DEFAULT].synchronize()
             step_loss = float(step_loss_tensor.cast(dtypes.float).item())
         except Exception as step_err:
+            if isinstance(step_err, (RuntimeError, TypeError, ValueError, AttributeError, NameError)):
+                sys.stderr.write(f"\n❌ [STRUCTURAL ERROR] Step {step} failed with {type(step_err).__name__}: {step_err}\n")
+                sys.stderr.flush()
+                raise step_err
             sys.stderr.write(f"\n⚠️ [RECOVERY WARNING] Step {step} execution error ({step_err}). Resetting JIT state...\n")
             sys.stderr.flush()
             try:
