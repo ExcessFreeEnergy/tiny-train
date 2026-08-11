@@ -1,12 +1,41 @@
 # Tinygrad High-Performance Transformer Optimization & Training Engine
 
-High-performance, hardware-optimized Transformer model training engine built on [tinygrad](https://github.com/tinygrad/tinygrad). Designed for maximum Model FLOPs Utilization (MFU) on NVIDIA Ada Lovelace GPUs (e.g., RTX 4090).
+High-performance, hardware-optimized Transformer model training and inference engine built on [tinygrad](https://github.com/tinygrad/tinygrad). Designed for high-speed training and real-time interactive text generation on NVIDIA Ada Lovelace GPUs.
 
 ## Objectives & Target Performance
 
 - **Target Model Architecture**: 125M Parameter Transformer (`d_model=768`, `n_layers=12`, `n_heads=12`, `d_ff=3072`, `vocab_size=14,080` padded).
 - **End Goal**: Complete a **1 Billion token** training run in **under 4 hours** (< 240 minutes).
-- **Target MFU**: **~35% MFU (~115.5 TFLOPS)** sustained performance on NVIDIA RTX 4090 (330 TFLOPS BF16 peak).
+
+---
+
+## 💬 Interactive Textual TUI Chat Application
+
+An interactive, multi-turn TUI chat interface powered by **Textual** and **`uv`**. It pre-compiles `@TinyJit` execution graphs at application startup and uses 1-token warm prompt streaming to eliminate all JIT compilation pauses across multi-turn dialogue.
+
+![Interactive Textual Chat TUI](assets/chat_ui.png)
+
+### Launching the Chat TUI
+
+```bash
+# Launch interactive chat directly
+uv run python chat.py
+
+# Launch interactive chat via run.py
+uv run python run.py --checkpoint checkpoints/model_125m_step_5500.safetensors --dataset fineweb --interactive
+```
+
+### Key TUI Features & Controls
+
+- **100% Warm `@TinyJit` Startup**: Pre-compiles GPU kernels and captures JIT graphs during startup to deliver **66ms – 150ms TTFT** and **~76 tokens/sec** instant generation.
+- **Dynamic Telemetry Header**: Live overlay displaying KV-cache window usage (`[████░░░░] 412/1024`), TTFT latency, tok/sec generation speed, VRAM usage, and active status.
+- **$O(1)$ KV Cache Position Rewinding**: Instant context reset (`/clear`), turn popping (`/pop`), and turn retrying (`/retry`) without re-loading model weights.
+- **Slash Commands**:
+  - **Generation**: `/temp <float>`, `/top_p <float>`, `/top_k <int>`, `/tokens <int>`, `/params`
+  - **Context**: `/clear`, `/system <text>`, `/pop`, `/context`, `/retry`
+  - **File I/O**: `/load <path>`, `/save <path>`, `/export [path]`, `/exec <cmd>`
+  - **Telemetry**: `/stats`, `/bench`, `/profile`
+  - **UI Controls**: `/help`, `/markdown`, `/compact`, `/copy`, `/exit`
 
 ---
 
@@ -27,6 +56,14 @@ High-performance, hardware-optimized Transformer model training engine built on 
 │    ├── Streams dataset via np.memmap                        │
 │    ├── Cosine LR Decay + Warmup Schedule                    │
 │    └── Safetensors Checkpointing & Validation Loss Evaluation │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ Checkpoints safetensors
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. INTERACTIVE CHAT ENGINE (chat.py / src/chat_engine.py)   │
+│    ├── Stateful JIT Warm @TinyJit Execution                 │
+│    ├── O(1) KV-Cache Rewinding                              │
+│    └── Textual Terminal UI with Live Telemetry Overlay      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -36,17 +73,22 @@ High-performance, hardware-optimized Transformer model training engine built on 
 
 ```text
 tiny_train/
+├── assets/                   # UI documentation assets & screenshots
+│   └── chat_ui.png           # Interactive Textual TUI screenshot
 ├── conf/                     # Configuration files & telemetry output
 │   ├── config.json
 │   ├── best_config.json
 │   └── score.json
 ├── src/                      # Source code modules
 │   ├── __init__.py
+│   ├── chat_engine.py        # Stateful JIT Warm LLM Chat Engine
 │   ├── model.py              # Transformer model architecture
 │   ├── train_production.py   # Production training engine
 │   ├── harness.py            # Optimization suite & execution wrapper
 │   ├── optimize.py           # Automated transient optimization loop with TUI
 │   └── retokenize.py         # Dataset tokenization script
+├── chat.py                   # Textual Interactive TUI Chat Application
+├── run.py                    # Inference CLI harness & TUI launcher
 ├── checkpoints/              # Checkpoint output directory
 ├── data/                     # Training datasets
 ├── lint.sh                   # Linter & formatter verification script
@@ -70,14 +112,25 @@ uv sync
 ./lint.sh
 ```
 
-### 2. Main Production Trainer (`src/train_production.py`)
+### 2. Interactive LLM Chat (`chat.py` / `run.py`)
+
+Run the Textual TUI to chat with your trained model checkpoints:
+```bash
+# Launch interactive chat TUI
+uv run python run.py --interactive
+
+# Specify custom checkpoint or dataset scale
+uv run python chat.py --checkpoint checkpoints/model_125m_step_5500.safetensors --dataset fineweb
+```
+
+### 3. Main Production Trainer (`src/train_production.py`)
 
 Run `src/train_production.py` to train the 125M (or 15M) parameter Transformer model:
 ```bash
 uv run python src/train_production.py --model-size 125M
 ```
 
-### 3. Stage 1: Harness Optimization Suite (`src/harness.py`)
+### 4. Stage 1: Harness Optimization Suite (`src/harness.py`)
 
 #### Run the Full Transient Optimization Suite:
 Automatically sweeps micro-batch sizes, BEAM compiler levels, and SwiGLU activation fusion, locking winning parameters into `conf/best_config.json`:
@@ -113,7 +166,7 @@ python src/harness.py --sweep-batch
 python src/harness.py
 ```
 
-### 4. Stage 2: Production Model Training (`src/train_production.py`)
+### 5. Stage 2: Production Model Training (`src/train_production.py`)
 
 To launch a full production training run using `conf/best_config.json`:
 

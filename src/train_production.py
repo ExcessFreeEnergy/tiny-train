@@ -147,6 +147,7 @@ def main():
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
     parser.add_argument("--resume-path", type=str, default=None, help="Explicit path to checkpoint file to resume from")
+    parser.add_argument("--learning-rate", "--lr", type=float, default=None, help="Override peak learning rate")
     args = parser.parse_args()
 
     disable_debug = args.disable_debug or args.debug_level == 0 or os.environ.get("DEBUG") == "0"
@@ -175,7 +176,7 @@ def main():
     grad_accum_steps = int(config.get("GRAD_ACCUMULATION_STEPS", 4))
     eff_batch_size = micro_batch_size * grad_accum_steps
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
-    max_lr = float(config.get("LEARNING_RATE", 4e-4))
+    max_lr = float(args.learning_rate) if args.learning_rate is not None else float(config.get("LEARNING_RATE", 4e-4))
     min_lr = max_lr * 0.1
     warmup_iters = max(10, int(args.total_steps * 0.05))
 
@@ -524,7 +525,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except Exception:
         import traceback
 
         traceback.print_exc()

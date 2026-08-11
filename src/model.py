@@ -3,7 +3,7 @@ model.py - High-Performance Transformer Architecture for tinygrad.
 Supports Tensor Core alignment, Fused RoPE, RMSNorm, FlashAttention SDPA, and SwiGLU.
 """
 
-from tinygrad import Tensor, Variable, dtypes, nn
+from tinygrad import Tensor, dtypes, nn
 
 
 def pad_vocab_size(vocab_size: int, multiple: int = 128, power_of_two: bool = False) -> int:
