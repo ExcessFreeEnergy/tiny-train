@@ -60,15 +60,80 @@ from tinygrad.nn.state import get_parameters, get_state_dict, load_state_dict, s
 from model import GPT
 
 
+def get_layer_depth(param_name: str, n_layers: int) -> int:
+    if param_name.startswith("wte") or param_name.startswith("wpe") or param_name.startswith("emb"):
+        return 0
+    match = re.match(r"^h\.(\d+)\.", param_name)
+    if match:
+        return int(match.group(1)) + 1
+    if param_name.startswith("rms_f") or param_name.startswith("head") or param_name.startswith("lm_head"):
+        return n_layers + 1
+    return n_layers + 1
+
+
+def build_optimizer(model: GPT, max_lr: float, weight_decay: float, use_llrd: bool, llrd_decay: float):
+    state_dict = get_state_dict(model)
+    n_layers = len(model.h)
+    total_layers = n_layers + 1
+
+    if not use_llrd:
+        params = get_parameters(model)
+        decay_params = [p for p in params if len(p.shape) >= 2]
+        nodecay_params = [p for p in params if len(p.shape) < 2]
+        opt_decay = AdamW(decay_params, lr=max_lr, weight_decay=weight_decay)
+        opt_nodecay = AdamW(nodecay_params, lr=max_lr, weight_decay=0.0)
+        setattr(opt_decay, "llrd_scale", 1.0)
+        setattr(opt_nodecay, "llrd_scale", 1.0)
+        return OptimizerGroup(opt_decay, opt_nodecay), {"active": False, "gamma": llrd_decay, "layer_lrs": {}}
+
+    layer_groups: dict[int, list[tuple[str, Tensor]]] = {d: [] for d in range(total_layers + 1)}
+    for name, p in state_dict.items():
+        if not p.is_param:
+            continue
+        d = get_layer_depth(name, n_layers)
+        layer_groups[d].append((name, p))
+
+    opts = []
+    layer_lrs = {}
+    for d in range(total_layers + 1):
+        group = layer_groups[d]
+        if not group:
+            continue
+        scale = llrd_decay ** (total_layers - d)
+        layer_lrs[d] = scale
+
+        decay_p = [p for name, p in group if len(p.shape) >= 2]
+        nodecay_p = [p for name, p in group if len(p.shape) < 2]
+
+        if decay_p:
+            opt_d = AdamW(decay_p, lr=max_lr, weight_decay=weight_decay)
+            setattr(opt_d, "llrd_scale", scale)
+            opts.append(opt_d)
+        if nodecay_p:
+            opt_nd = AdamW(nodecay_p, lr=max_lr, weight_decay=0.0)
+            setattr(opt_nd, "llrd_scale", scale)
+            opts.append(opt_nd)
+
+    optimizer = OptimizerGroup(*opts)
+    info = {
+        "active": True,
+        "gamma": llrd_decay,
+        "total_layers": total_layers,
+        "layer_lrs": layer_lrs,
+    }
+    return optimizer, info
+
+
 def save_checkpoint(model: GPT, optimizer: OptimizerGroup, step: int, ckpt_path: str):
     state = get_state_dict(model)
     param_to_key = {id(p): k for k, p in state.items()}
 
-    opt_decay, opt_nodecay = optimizer.optimizers[0], optimizer.optimizers[1]
-    state["opt.decay.b1_t"] = opt_decay.b1_t
-    state["opt.decay.b2_t"] = opt_decay.b2_t
-    state["opt.nodecay.b1_t"] = opt_nodecay.b1_t
-    state["opt.nodecay.b2_t"] = opt_nodecay.b2_t
+    if len(optimizer.optimizers) > 0:
+        first_opt = optimizer.optimizers[0]
+        state["opt.decay.b1_t"] = first_opt.b1_t
+        state["opt.decay.b2_t"] = first_opt.b2_t
+        state["opt.nodecay.b1_t"] = first_opt.b1_t
+        state["opt.nodecay.b2_t"] = first_opt.b2_t
 
     for opt in optimizer.optimizers:
         for i, p in enumerate(opt.params):
@@ -89,15 +154,12 @@ def load_checkpoint(model: GPT, optimizer: OptimizerGroup, ckpt_path: str) -> in
     if "global_step" in state:
         resumed_step = int(state["global_step"].cast(dtypes.int32).to(Device.DEFAULT).item())
 
-    opt_decay, opt_nodecay = optimizer.optimizers[0], optimizer.optimizers[1]
     if "opt.decay.b1_t" in state:
-        opt_decay.b1_t.assign(state["opt.decay.b1_t"].cast(opt_decay.b1_t.dtype).to(opt_decay.b1_t.device))
+        for opt in optimizer.optimizers:
+            opt.b1_t.assign(state["opt.decay.b1_t"].cast(opt.b1_t.dtype).to(opt.b1_t.device))
     if "opt.decay.b2_t" in state:
-        opt_decay.b2_t.assign(state["opt.decay.b2_t"].cast(opt_decay.b2_t.dtype).to(opt_decay.b2_t.device))
-    if "opt.nodecay.b1_t" in state:
-        opt_nodecay.b1_t.assign(state["opt.nodecay.b1_t"].cast(opt_nodecay.b1_t.dtype).to(opt_nodecay.b1_t.device))
-    if "opt.nodecay.b2_t" in state:
-        opt_nodecay.b2_t.assign(state["opt.nodecay.b2_t"].cast(opt_nodecay.b2_t.dtype).to(opt_nodecay.b2_t.device))
+        for opt in optimizer.optimizers:
+            opt.b2_t.assign(state["opt.decay.b2_t"].cast(opt.b2_t.dtype).to(opt.b2_t.device))
 
     model_state = get_state_dict(model)
     param_to_key = {id(p): k for k, p in model_state.items()}
@@ -148,6 +210,9 @@ def main():
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
     parser.add_argument("--resume-path", type=str, default=None, help="Explicit path to checkpoint file to resume from")
     parser.add_argument("--learning-rate", "--lr", type=float, default=None, help="Override peak learning rate")
+    parser.add_argument("--use-llrd", action="store_true", default=None, help="Enable Layer-wise Learning Rate Decay (LLRD)")
+    parser.add_argument("--no-llrd", action="store_false", dest="use_llrd", help="Disable Layer-wise Learning Rate Decay (LLRD)")
+    parser.add_argument("--llrd-decay", "--llrd-gamma", type=float, default=None, help="LLRD decay factor gamma (default: 0.9 or from config)")
     args = parser.parse_args()
 
     disable_debug = args.disable_debug or args.debug_level == 0 or os.environ.get("DEBUG") == "0"
@@ -155,6 +220,13 @@ def main():
         os.environ["DEBUG"] = "0"
 
     config = load_config(args.config)
+
+    if args.use_llrd is not None:
+        use_llrd = args.use_llrd
+    else:
+        use_llrd = bool(config.get("USE_LLRD", 1))
+
+    llrd_decay = float(args.llrd_decay) if args.llrd_decay is not None else float(config.get("LLRD_DECAY", config.get("LLRD_GAMMA", 0.9)))
 
     dataset_name = (args.dataset or config.get("DATASET", "tinystories")).lower()
 
@@ -287,19 +359,10 @@ def main():
     for p in params:
         p.accum_grad = Tensor.zeros_like(p).realize()
 
-    # Parameter rank partitioning for weight decay natively on model parameters
-    decay_params = [p for p in params if len(p.shape) >= 2]
-    nodecay_params = [p for p in params if len(p.shape) < 2]
     weight_decay = float(config.get("WEIGHT_DECAY", 0.01))
     max_grad_norm = float(config.get("MAX_GRAD_NORM", 1.0))
 
-    opt_decay = AdamW(decay_params, lr=max_lr, weight_decay=weight_decay)
-    opt_nodecay = AdamW(nodecay_params, lr=max_lr, weight_decay=0.0)
-    optimizer = OptimizerGroup(opt_decay, opt_nodecay)
-
-    lr_tensor = Tensor([max_lr], dtype=dtypes.float, device=params[0].device).realize()
-    opt_decay.lr = lr_tensor
-    opt_nodecay.lr = lr_tensor
+    optimizer, llrd_info = build_optimizer(model, max_lr, weight_decay, use_llrd, llrd_decay)
 
     # Load initial state dict and optimizer momentum/variance buffers if resuming
     if ckpt_path_to_load:
@@ -323,6 +386,11 @@ def main():
     print(f"Parameters: {param_count:,} | Padded Vocab: {model.vocab_size}", flush=True)
     print(f"Micro-Batch: {micro_batch_size} | Grad Accum: {grad_accum_steps} | Effective Batch: {eff_batch_size} | Seq Len: {seq_len}", flush=True)
     print(f"Precision: {default_float_str} | RoPE: {use_rope} | SwiGLU: {use_swiglu} | BEAM: {os.environ.get('BEAM')}", flush=True)
+    if use_llrd:
+        min_scale = llrd_decay ** (n_layers + 1)
+        print(f"LLRD: ENABLED (gamma={llrd_decay:.3f}) | Depths: 0..{n_layers+1} | Peak LRs: Embedding={max_lr * min_scale:.3e} -> Head={max_lr:.3e}", flush=True)
+    else:
+        print("LLRD: DISABLED", flush=True)
     print("=======================================================\n", flush=True)
 
     flops_per_step = 6.0 * param_count * eff_batch_size * seq_len
@@ -414,7 +482,9 @@ def main():
     # Production Training Loop
     for step in range(start_step, args.total_steps + 1):
         cur_lr = get_lr_schedule(step, args.total_steps, warmup_iters, max_lr, min_lr)
-        lr_tensor.assign([cur_lr]).realize()
+        for opt in optimizer.optimizers:
+            opt_lr = cur_lr * getattr(opt, "llrd_scale", 1.0)
+            opt.lr.assign([opt_lr]).realize()
 
         x_b, y_b = get_batch(train_data, step)
 
@@ -498,6 +568,8 @@ def main():
         "final_loss": round(last_loss_val, 4),
         "nan_detected": False,
         "jit_active": use_jit,
+        "llrd_active": use_llrd,
+        "llrd_decay": llrd_decay if use_llrd else 1.0,
         "micro_batch_size": micro_batch_size,
         "grad_accumulation_steps": grad_accum_steps,
         "effective_batch_size": eff_batch_size,
