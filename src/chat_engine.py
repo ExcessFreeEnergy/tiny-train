@@ -8,6 +8,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
+import numpy as np
 import tiktoken
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.helpers import GlobalCounters, Profiling, Timing
@@ -60,6 +61,17 @@ def find_latest_checkpoint(checkpoint_dir: str = "checkpoints", model_size: str 
     return best_ckpt
 
 
+def apply_repetition_penalty(logits: Tensor, penalty: float = 1.15, context_mask: Tensor | None = None) -> Tensor:
+    """Apply repetition penalty on-device using TinyGrad Tensor ops.
+
+    Positive logits are divided by penalty, negative logits are multiplied by penalty for tokens in context_mask.
+    """
+    if penalty == 1.0 or context_mask is None:
+        return logits
+    penalized = (logits > 0).where(logits / penalty, logits * penalty)
+    return context_mask.where(penalized, logits)
+
+
 def sample_logits(logits: Tensor, temp: float = 0.8, top_k: int = 40, top_p: float = 0.9) -> Tensor:
     """Sample next token index on device using temperature scaling, top-k, and nucleus top-p filtering."""
     assert logits.ndim == 1, "sample expects 1D logits tensor"
@@ -108,16 +120,38 @@ class GPTEngine:
         self.raw_vocab_size = model.raw_vocab_size
         self.step_jit = TinyJit(self.step) if use_jit else None
 
-    def step(self, tokens: Tensor, start_pos: Variable | int, temperature: float, top_k: int, top_p: float) -> Tensor:
+    def step(
+        self,
+        tokens: Tensor,
+        start_pos: Variable | int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        repetition_penalty: float = 1.15,
+        context_mask: Tensor | None = None,
+    ) -> Tensor:
         logits = self.model.forward(tokens, start_pos=start_pos)
         last_logits = logits[0, -1, : self.raw_vocab_size]
+        if repetition_penalty != 1.0 and context_mask is not None:
+            last_logits = apply_repetition_penalty(last_logits, penalty=repetition_penalty, context_mask=context_mask)
         return sample_logits(last_logits, temp=temperature, top_k=top_k, top_p=top_p)
 
-    def __call__(self, tokens: Tensor, start_pos: int, temperature: float = 0.8, top_k: int = 40, top_p: float = 0.9) -> Tensor:
+    def __call__(
+        self,
+        tokens: Tensor,
+        start_pos: int,
+        temperature: float = 0.8,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.15,
+        context_mask: Tensor | None = None,
+    ) -> Tensor:
+        if context_mask is None:
+            context_mask = Tensor.zeros(self.raw_vocab_size, dtype=dtypes.bool, device=Device.DEFAULT).clone().realize()
         if tokens.shape == (1, 1) and self.step_jit is not None:
             v_start_pos = Variable("start_pos", 0, self.max_context - 1).bind(start_pos)
-            return self.step_jit(tokens, v_start_pos, temperature, top_k, top_p)
-        return self.step(tokens, start_pos, temperature, top_k, top_p)
+            return self.step_jit(tokens, v_start_pos, temperature, top_k, top_p, repetition_penalty, context_mask)
+        return self.step(tokens, start_pos, temperature, top_k, top_p, repetition_penalty, context_mask)
 
 
 @dataclass
@@ -161,6 +195,7 @@ class GPTEngineManager:
         self.temperature = 0.8
         self.top_p = 0.9
         self.top_k = 40
+        self.repetition_penalty = 1.15
         self.max_tokens = 256
         self.system_prompt = ""
         self.profile = False
@@ -234,8 +269,17 @@ class GPTEngineManager:
         if not self.use_jit:
             return
         tok = Tensor([[50256]], dtype=dtypes.int32).realize()
+        dummy_mask = Tensor.zeros(self.engine.raw_vocab_size, dtype=dtypes.bool, device=Device.DEFAULT).clone().realize()
         for s in range(3):
-            tok = self.engine(tok.reshape(1, 1), start_pos=s, temperature=self.temperature, top_k=self.top_k, top_p=self.top_p).realize()
+            tok = self.engine(
+                tok.reshape(1, 1),
+                start_pos=s,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                repetition_penalty=self.repetition_penalty,
+                context_mask=dummy_mask,
+            ).realize()
         self.model.reset_cache()
         self.start_pos = 0
 
@@ -283,7 +327,16 @@ class GPTEngineManager:
             return
         sys_tokens = self.encode_text(f"System: {self.system_prompt}\n")
         x_sys = Tensor([sys_tokens], dtype=dtypes.int32).realize()
-        self.engine(x_sys, start_pos=0, temperature=self.temperature, top_k=self.top_k, top_p=self.top_p).realize()
+        dummy_mask = Tensor.zeros(self.engine.raw_vocab_size, dtype=dtypes.bool, device=Device.DEFAULT).clone().realize()
+        self.engine(
+            x_sys,
+            start_pos=0,
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+            context_mask=dummy_mask,
+        ).realize()
         start = self.start_pos
         self.start_pos += len(sys_tokens)
         self.history.append(ChatTurn("system", self.system_prompt, sys_tokens, start, self.start_pos))
@@ -353,16 +406,40 @@ class GPTEngineManager:
         user_turn_end = user_turn_start + prompt_len
         self.history.append(ChatTurn("user", prompt, prompt_tokens, user_turn_start, user_turn_end))
 
+        # Collect all context token IDs in sequence history + prompt
+        context_token_ids = set()
+        for turn in self.history:
+            context_token_ids.update(turn.token_ids)
+        context_token_ids.update(prompt_tokens)
+
+        # Build initial context_mask on device
+        mask_np = np.zeros(self.engine.raw_vocab_size, dtype=bool)
+        valid_ids = [tid for tid in context_token_ids if 0 <= tid < self.engine.raw_vocab_size]
+        if valid_ids:
+            mask_np[valid_ids] = True
+        context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
+
         # 1. Prompt Phase (Fill KV Cache via warm 1-token JIT steps)
         t0 = time.perf_counter()
         tok_tensor = None
         for pos, tid in enumerate(prompt_tokens):
             x_tok = Tensor([[tid]], dtype=dtypes.int32).realize()
-            tok_tensor = self.engine(x_tok, start_pos=self.start_pos + pos, temperature=self.temperature, top_k=self.top_k, top_p=self.top_p).realize()
+            tok_tensor = self.engine(
+                x_tok,
+                start_pos=self.start_pos + pos,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+                repetition_penalty=self.repetition_penalty,
+                context_mask=context_mask,
+            ).realize()
         next_id = tok_tensor.item()
         ttft_ms = (time.perf_counter() - t0) * 1000.0
 
         current_gen_ids = [next_id]
+        if 0 <= next_id < self.engine.raw_vocab_size:
+            mask_np[next_id] = True
+            context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
         self.start_pos += prompt_len
 
         # Stream first token text
@@ -384,13 +461,25 @@ class GPTEngineManager:
 
                 with Timing("total", enabled=self.timing):
                     x_in = tok_tensor.reshape(1, 1)
-                    tok_tensor = self.engine(x_in, start_pos=self.start_pos, temperature=self.temperature, top_k=self.top_k, top_p=self.top_p).realize()
+                    tok_tensor = self.engine(
+                        x_in,
+                        start_pos=self.start_pos,
+                        temperature=self.temperature,
+                        top_k=self.top_k,
+                        top_p=self.top_p,
+                        repetition_penalty=self.repetition_penalty,
+                        context_mask=context_mask,
+                    ).realize()
                     next_id = tok_tensor.item()
 
                 step_ms = (time.perf_counter() - t_step_0) * 1000.0
                 token_times.append(step_ms)
                 current_gen_ids.append(next_id)
                 self.start_pos += 1
+
+                if 0 <= next_id < self.engine.raw_vocab_size:
+                    mask_np[next_id] = True
+                    context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
 
                 chunk = self.decode_token(next_id)
 
@@ -428,11 +517,26 @@ class GPTEngineManager:
         dummy_prompt = "Once upon a time in a benchmark test"
         prompt_ids = self.encode_text(dummy_prompt)
 
+        context_token_ids = set(prompt_ids)
+        mask_np = np.zeros(self.engine.raw_vocab_size, dtype=bool)
+        valid_ids = [tid for tid in context_token_ids if 0 <= tid < self.engine.raw_vocab_size]
+        if valid_ids:
+            mask_np[valid_ids] = True
+        context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
+
         t0 = time.perf_counter()
         tok_tensor = None
         for pos, tid in enumerate(prompt_ids):
             x_tok = Tensor([[tid]], dtype=dtypes.int32).realize()
-            tok_tensor = self.engine(x_tok, start_pos=pos, temperature=0.8, top_k=40, top_p=0.9).realize()
+            tok_tensor = self.engine(
+                x_tok,
+                start_pos=pos,
+                temperature=0.8,
+                top_k=40,
+                top_p=0.9,
+                repetition_penalty=self.repetition_penalty,
+                context_mask=context_mask,
+            ).realize()
         ttft_ms = (time.perf_counter() - t0) * 1000.0
 
         step_times = []
@@ -444,7 +548,19 @@ class GPTEngineManager:
             GlobalCounters.reset()
             t_s = time.perf_counter()
             x_in = tok_tensor.reshape(1, 1)
-            tok_tensor = self.engine(x_in, start_pos=start_pos + i - 1, temperature=0.8, top_k=40, top_p=0.9).realize()
+            tok_tensor = self.engine(
+                x_in,
+                start_pos=start_pos + i - 1,
+                temperature=0.8,
+                top_k=40,
+                top_p=0.9,
+                repetition_penalty=self.repetition_penalty,
+                context_mask=context_mask,
+            ).realize()
+            next_id = tok_tensor.item()
+            if 0 <= next_id < self.engine.raw_vocab_size:
+                mask_np[next_id] = True
+                context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
             dt = (time.perf_counter() - t_s) * 1000.0
             step_times.append(dt)
             if dt > 0:

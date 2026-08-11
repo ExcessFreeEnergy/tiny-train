@@ -24,11 +24,13 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+import numpy as np
 import tiktoken
 from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.helpers import GlobalCounters, Profiling, Timing
 from tinygrad.nn.state import get_parameters, load_state_dict, safe_load
 
+from src.chat_engine import apply_repetition_penalty
 from src.model import GPT
 
 
@@ -107,16 +109,36 @@ class GPTEngine:
         self.raw_vocab_size = model.raw_vocab_size
         self.step_jit = TinyJit(self.step) if use_jit else None
 
-    def step(self, tokens: Tensor, start_pos: Variable | int, temperature: float, top_k: int) -> Tensor:
+    def step(
+        self,
+        tokens: Tensor,
+        start_pos: Variable | int,
+        temperature: float,
+        top_k: int,
+        repetition_penalty: float = 1.15,
+        context_mask: Tensor | None = None,
+    ) -> Tensor:
         logits = self.model.forward(tokens, start_pos=start_pos)
         last_logits = logits[0, -1, : self.raw_vocab_size]
+        if repetition_penalty != 1.0 and context_mask is not None:
+            last_logits = apply_repetition_penalty(last_logits, penalty=repetition_penalty, context_mask=context_mask)
         return sample(last_logits, temp=temperature, top_k=top_k)
 
-    def __call__(self, tokens: Tensor, start_pos: int, temperature: float = 0.8, top_k: int = 40) -> Tensor:
+    def __call__(
+        self,
+        tokens: Tensor,
+        start_pos: int,
+        temperature: float = 0.8,
+        top_k: int = 40,
+        repetition_penalty: float = 1.15,
+        context_mask: Tensor | None = None,
+    ) -> Tensor:
+        if context_mask is None:
+            context_mask = Tensor.zeros(self.raw_vocab_size, dtype=dtypes.bool, device=Device.DEFAULT).clone().realize()
         if tokens.shape == (1, 1) and self.step_jit is not None and start_pos != 0:
             v_start_pos = Variable("start_pos", 1, self.max_context - 1).bind(start_pos)
-            return self.step_jit(tokens, v_start_pos, temperature, top_k)
-        return self.step(tokens, start_pos, temperature, top_k)
+            return self.step_jit(tokens, v_start_pos, temperature, top_k, repetition_penalty, context_mask)
+        return self.step(tokens, start_pos, temperature, top_k, repetition_penalty, context_mask)
 
 
 def generate_text(
@@ -128,6 +150,7 @@ def generate_text(
     max_new_tokens: int = 100,
     temperature: float = 0.8,
     top_k: int = 40,
+    repetition_penalty: float = 1.15,
     profile: bool = False,
     timing: bool = False,
 ) -> str:
@@ -146,6 +169,12 @@ def generate_text(
     current_ids = list(trimmed_prompt_ids)
     prompt_len = len(trimmed_prompt_ids)
 
+    mask_np = np.zeros(engine.raw_vocab_size, dtype=bool)
+    valid_ids = [tid for tid in trimmed_prompt_ids if 0 <= tid < engine.raw_vocab_size]
+    if valid_ids:
+        mask_np[valid_ids] = True
+    context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
+
     print(f'\n📝 Prompt: "{prompt}"', flush=True)
     print("-------------------------------------------------------", flush=True)
     sys.stdout.write(prompt)
@@ -157,9 +186,19 @@ def generate_text(
         # 1. Prompt Phase (Fill initial KV cache for prompt tokens)
         t0 = time.perf_counter()
         x_prompt = Tensor([trimmed_prompt_ids], dtype=dtypes.int32).realize()
-        tok_tensor = engine(x_prompt, start_pos=0, temperature=temperature, top_k=top_k).realize()
+        tok_tensor = engine(
+            x_prompt,
+            start_pos=0,
+            temperature=temperature,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            context_mask=context_mask,
+        ).realize()
         next_trimmed_id = tok_tensor.item()
         current_ids.append(next_trimmed_id)
+        if 0 <= next_trimmed_id < engine.raw_vocab_size:
+            mask_np[next_trimmed_id] = True
+            context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
         ttft_ms = (time.perf_counter() - t0) * 1000.0
 
         # Stream first generated token
@@ -182,10 +221,21 @@ def generate_text(
                 on_exit=lambda x: f", {1e9 / x:.2f} tok/s, {GlobalCounters.global_mem / x:.2f} GB/s, param {param_bytes / x:.2f} GB/s",
             ):
                 x_in = tok_tensor.reshape(1, 1)
-                tok_tensor = engine(x_in, start_pos=start_pos, temperature=temperature, top_k=top_k).realize()
+                tok_tensor = engine(
+                    x_in,
+                    start_pos=start_pos,
+                    temperature=temperature,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    context_mask=context_mask,
+                ).realize()
                 next_trimmed_id = tok_tensor.item()
 
             current_ids.append(next_trimmed_id)
+            if 0 <= next_trimmed_id < engine.raw_vocab_size:
+                mask_np[next_trimmed_id] = True
+                context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
+
             start_pos += 1
             step_ms = (time.perf_counter() - t_step_0) * 1000.0
             token_times_ms.append(step_ms)
@@ -228,6 +278,7 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100, help="Number of new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature (0.0 for greedy)")
     parser.add_argument("--top-k", type=int, default=40, help="Top-k filtering threshold")
+    parser.add_argument("--repetition-penalty", type=float, default=1.15, help="Repetition penalty scalar (default 1.15)")
     parser.add_argument("--no-jit", action="store_true", default=False, help="Disable @TinyJit compilation")
     parser.add_argument("--timing", action="store_true", default=False, help="Print per-token timing and memory bandwidth")
     parser.add_argument("--profile", action="store_true", default=False, help="Enable detailed inference profiling telemetry")
@@ -259,6 +310,11 @@ def main():
 
     wte_shape = state["wte"].shape
     ckpt_padded_vocab_size = wte_shape[0]
+
+    # Auto-detect dataset if checkpoint vocab size > 30000 (FineWeb)
+    if ckpt_padded_vocab_size > 30000 and args.dataset.lower() == "tinystories":
+        args.dataset = "fineweb"
+        orig_to_new, new_to_orig = load_vocab_map(dataset_name=args.dataset)
 
     # Model Preset Architecture Parameters
     if args.model_size == "125M":
@@ -323,6 +379,7 @@ def main():
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            repetition_penalty=args.repetition_penalty,
             profile=args.profile,
             timing=args.timing,
         )

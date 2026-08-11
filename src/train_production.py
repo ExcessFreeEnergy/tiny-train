@@ -388,7 +388,10 @@ def main():
     print(f"Precision: {default_float_str} | RoPE: {use_rope} | SwiGLU: {use_swiglu} | BEAM: {os.environ.get('BEAM')}", flush=True)
     if use_llrd:
         min_scale = llrd_decay ** (n_layers + 1)
-        print(f"LLRD: ENABLED (gamma={llrd_decay:.3f}) | Depths: 0..{n_layers+1} | Peak LRs: Embedding={max_lr * min_scale:.3e} -> Head={max_lr:.3e}", flush=True)
+        print(
+            f"LLRD: ENABLED (gamma={llrd_decay:.3f}) | Depths: 0..{n_layers + 1} | Peak LRs: Embedding={max_lr * min_scale:.3e} -> Head={max_lr:.3e}",
+            flush=True,
+        )
     else:
         print("LLRD: DISABLED", flush=True)
     print("=======================================================\n", flush=True)

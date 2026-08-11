@@ -43,11 +43,8 @@ class CausalSelfAttention:
 
     def __call__(self, x: Tensor, freqs_cis: Tensor | None = None, start_pos: int | None = None) -> Tensor:
         b, t, c = x.shape
-        qkv = x @ self.c_attn
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
-        k = k.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
-        v = v.reshape(b, t, self.n_heads, self.head_dim).transpose(1, 2).contiguous()
+        qkv = (x @ self.c_attn).reshape(b, t, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         if start_pos is None:
             if self.use_rope and freqs_cis is not None:

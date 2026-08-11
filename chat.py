@@ -42,6 +42,7 @@ def create_params_table(manager: GPTEngineManager) -> Table:
     table.add_row("Temperature", str(manager.temperature), "Sampling randomness threshold")
     table.add_row("Top-P", str(manager.top_p), "Nucleus sampling probability cutoff")
     table.add_row("Top-K", str(manager.top_k), "Top token filter count")
+    table.add_row("Repetition Penalty", str(manager.repetition_penalty), "Logit penalty for context token repeats")
     table.add_row("Max Tokens", str(manager.max_tokens), "Max tokens generated per turn")
     table.add_row("System Prompt", manager.system_prompt or "None", "Active system persona")
     table.add_row("JIT Acceleration", "Enabled" if manager.use_jit else "Disabled", "@TinyJit graph execution")
@@ -60,6 +61,7 @@ def create_help_table() -> Table:
     table.add_row("Generation", "/temp <float>", "Set sampling temperature (e.g. /temp 0.7)")
     table.add_row("", "/top_p <float>", "Set top-P nucleus threshold (e.g. /top_p 0.9)")
     table.add_row("", "/top_k <int>", "Set top-K filter threshold (e.g. /top_k 40)")
+    table.add_row("", "/penalty <float>", "Set repetition penalty (e.g. /penalty 1.15)")
     table.add_row("", "/tokens <int>", "Set max generated tokens per turn (e.g. /tokens 256)")
     table.add_row("", "/params", "Print active hyperparameter table")
 
@@ -507,6 +509,14 @@ class TinyChatApp(App):
                 chat_view.mount(SystemNotice(f"🔢 Top-K set to `{self.manager.top_k}`"))
             except ValueError:
                 chat_view.mount(SystemNotice("⚠️ Usage: `/top_k <int>` (e.g. `/top_k 40`)"))
+
+        elif cmd in ["/penalty", "/rep_penalty", "/repetition_penalty"]:
+            try:
+                val = float(arg)
+                self.manager.repetition_penalty = max(1.0, val)
+                chat_view.mount(SystemNotice(f"🔄 Repetition penalty set to `{self.manager.repetition_penalty}`"))
+            except ValueError:
+                chat_view.mount(SystemNotice("⚠️ Usage: `/penalty <float>` (e.g. `/penalty 1.15`)"))
 
         elif cmd in ["/tokens", "/max_tokens"]:
             try:
