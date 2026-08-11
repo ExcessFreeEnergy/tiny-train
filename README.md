@@ -9,36 +9,6 @@ High-performance, hardware-optimized Transformer model training and inference en
 
 ---
 
-## 💬 Interactive Textual TUI Chat Application
-
-An interactive, multi-turn TUI chat interface powered by **Textual** and **`uv`**. It pre-compiles `@TinyJit` execution graphs at application startup and uses 1-token warm prompt streaming to eliminate all JIT compilation pauses across multi-turn dialogue.
-
-![Interactive Textual Chat TUI](assets/chat_ui.png)
-
-### Launching the Chat TUI
-
-```bash
-# Launch interactive chat directly
-uv run python chat.py
-
-# Launch interactive chat via run.py
-uv run python run.py --checkpoint checkpoints/model_125m_step_5500.safetensors --dataset fineweb --interactive
-```
-
-### Key TUI Features & Controls
-
-- **100% Warm `@TinyJit` Startup**: Pre-compiles GPU kernels and captures JIT graphs during startup to deliver **66ms – 150ms TTFT** and **~76 tokens/sec** instant generation.
-- **Dynamic Telemetry Header**: Live overlay displaying KV-cache window usage (`[████░░░░] 412/1024`), TTFT latency, tok/sec generation speed, VRAM usage, and active status.
-- **$O(1)$ KV Cache Position Rewinding**: Instant context reset (`/clear`), turn popping (`/pop`), and turn retrying (`/retry`) without re-loading model weights.
-- **Slash Commands**:
-  - **Generation**: `/temp <float>`, `/top_p <float>`, `/top_k <int>`, `/tokens <int>`, `/params`
-  - **Context**: `/clear`, `/system <text>`, `/pop`, `/context`, `/retry`
-  - **File I/O**: `/load <path>`, `/save <path>`, `/export [path]`, `/exec <cmd>`
-  - **Telemetry**: `/stats`, `/bench`, `/profile`
-  - **UI Controls**: `/help`, `/markdown`, `/compact`, `/copy`, `/exit`
-
----
-
 ## 2-Stage Pipeline Architecture
 
 ```text
@@ -112,25 +82,14 @@ uv sync
 ./lint.sh
 ```
 
-### 2. Interactive LLM Chat (`chat.py` / `run.py`)
-
-Run the Textual TUI to chat with your trained model checkpoints:
-```bash
-# Launch interactive chat TUI
-uv run python run.py --interactive
-
-# Specify custom checkpoint or dataset scale
-uv run python chat.py --checkpoint checkpoints/model_125m_step_5500.safetensors --dataset fineweb
-```
-
-### 3. Main Production Trainer (`src/train_production.py`)
+### 2. Main Production Trainer (`src/train_production.py`)
 
 Run `src/train_production.py` to train the 125M (or 15M) parameter Transformer model:
 ```bash
 uv run python src/train_production.py --model-size 125M
 ```
 
-### 4. Stage 1: Harness Optimization Suite (`src/harness.py`)
+### 3. Stage 1: Harness Optimization Suite (`src/harness.py`)
 
 #### Run the Full Transient Optimization Suite:
 Automatically sweeps micro-batch sizes, BEAM compiler levels, and SwiGLU activation fusion, locking winning parameters into `conf/best_config.json`:
@@ -166,7 +125,7 @@ python src/harness.py --sweep-batch
 python src/harness.py
 ```
 
-### 5. Stage 2: Production Model Training (`src/train_production.py`)
+### 4. Stage 2: Production Model Training (`src/train_production.py`)
 
 To launch a full production training run using `conf/best_config.json`:
 
@@ -212,3 +171,33 @@ uv run python src/train_production.py --model-size 125M --total-steps 30518 --ev
 
 - **Linting & Code Formatting**: Run `./lint.sh` before submitting code changes.
 - **Check score telemetry**: Detailed execution telemetry is exported to `conf/score.json` after harness runs.
+
+---
+
+## 💬 Interactive Textual TUI Chat Application
+
+An interactive, multi-turn TUI chat interface powered by **Textual** and **`uv`**. It pre-compiles `@TinyJit` execution graphs at application startup and uses 1-token warm prompt streaming to eliminate all JIT compilation pauses across multi-turn dialogue.
+
+![Interactive Textual Chat TUI](assets/chat_ui.png)
+
+### Launching the Chat TUI
+
+```bash
+# Launch interactive chat directly
+uv run python chat.py
+
+# Launch interactive chat via run.py
+uv run python run.py --checkpoint checkpoints/model_125m_step_5500.safetensors --dataset fineweb --interactive
+```
+
+### Key TUI Features & Controls
+
+- **100% Warm `@TinyJit` Startup**: Pre-compiles GPU kernels and captures JIT graphs during startup to deliver **66ms – 150ms TTFT** and **~76 tokens/sec** instant generation.
+- **Dynamic Telemetry Header**: Live overlay displaying KV-cache window usage (`[████░░░░] 412/1024`), TTFT latency, tok/sec generation speed, VRAM usage, and active status.
+- **$O(1)$ KV Cache Position Rewinding**: Instant context reset (`/clear`), turn popping (`/pop`), and turn retrying (`/retry`) without re-loading model weights.
+- **Slash Commands**:
+  - **Generation**: `/temp <float>`, `/top_p <float>`, `/top_k <int>`, `/tokens <int>`, `/params`
+  - **Context**: `/clear`, `/system <text>`, `/pop`, `/context`, `/retry`
+  - **File I/O**: `/load <path>`, `/save <path>`, `/export [path]`, `/exec <cmd>`
+  - **Telemetry**: `/stats`, `/bench`, `/profile`
+  - **UI Controls**: `/help`, `/markdown`, `/compact`, `/copy`, `/exit`
