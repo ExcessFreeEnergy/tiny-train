@@ -3,7 +3,11 @@ model.py - High-Performance Transformer Architecture for tinygrad.
 Supports Tensor Core alignment, Fused RoPE, RMSNorm, FlashAttention SDPA, and SwiGLU.
 """
 
-from tinygrad import Tensor, dtypes, nn
+import os
+from tinygrad import Tensor, dtypes, getenv, nn
+
+if "HK_FLASH_ATTENTION" not in os.environ:
+    os.environ["HK_FLASH_ATTENTION"] = "1"
 
 
 def pad_vocab_size(vocab_size: int, multiple: int = 128, power_of_two: bool = False) -> int:
@@ -34,10 +38,11 @@ def apply_rope(x: Tensor, freqs_cis: Tensor) -> Tensor:
 class CausalSelfAttention:
     """Fused Scaled Dot-Product Causal Self-Attention with Static RoPE Buffers."""
 
-    def __init__(self, d_model: int, n_heads: int, use_rope: bool = True):
+    def __init__(self, d_model: int, n_heads: int, use_rope: bool = True, flash_attn: bool | None = None):
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
         self.use_rope = use_rope
+        self.flash_attn = bool(getenv("HK_FLASH_ATTENTION", 1)) if flash_attn is None else flash_attn
         self.c_attn = Tensor.glorot_uniform(d_model, 3 * d_model)
         self.c_proj = Tensor.glorot_uniform(d_model, d_model)
 
@@ -46,11 +51,21 @@ class CausalSelfAttention:
         qkv = (x @ self.c_attn).reshape(b, t, 3, self.n_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
+        use_fa = self.flash_attn and getenv("HK_FLASH_ATTENTION", 1)
+
         if start_pos is None:
             if self.use_rope and freqs_cis is not None:
                 q = apply_rope(q, freqs_cis[:t])
                 k = apply_rope(k, freqs_cis[:t])
-            y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
+            if use_fa:
+                try:
+                    from extra.thunder.amd.fa import flash_attention
+                    y, *_ = flash_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+                    y = y.transpose(1, 2)
+                except Exception:
+                    y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
+            else:
+                y = Tensor.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             if self.use_rope and freqs_cis is not None:
                 freqs = freqs_cis[start_pos : start_pos + t]
@@ -67,7 +82,15 @@ class CausalSelfAttention:
             values = self.cache_kv[1][:, :, : start_pos + t, :]
 
             mask = Tensor.full((1, 1, t, start_pos + t), float("-inf"), dtype=x.dtype).triu(start_pos + 1) if t > 1 else None
-            y = Tensor.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
+            if use_fa and mask is None:
+                try:
+                    from extra.thunder.amd.fa import flash_attention
+                    y, *_ = flash_attention(q.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2), is_causal=True)
+                    y = y.transpose(1, 2)
+                except Exception:
+                    y = Tensor.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
+            else:
+                y = Tensor.scaled_dot_product_attention(q, keys, values, attn_mask=mask)
 
         y = y.transpose(1, 2).reshape(b, t, c)
         return y @ self.c_proj
@@ -104,9 +127,9 @@ class SwiGLUMLP:
 class Block:
     """Transformer Block with Pre-RMSNorm and Pre-Attention Residuals."""
 
-    def __init__(self, d_model: int, n_heads: int, d_ff: int, use_swiglu: bool = False, use_rope: bool = True):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, use_swiglu: bool = False, use_rope: bool = True, flash_attn: bool | None = None):
         self.rms_1 = nn.RMSNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, use_rope=use_rope)
+        self.attn = CausalSelfAttention(d_model, n_heads, use_rope=use_rope, flash_attn=flash_attn)
         self.rms_2 = nn.RMSNorm(d_model)
         self.mlp = SwiGLUMLP(d_model, d_ff) if use_swiglu else GELUMLP(d_model, d_ff)
 
@@ -132,6 +155,7 @@ class GPT:
         max_len: int = 512,
         use_swiglu: bool = False,
         use_rope: bool = True,
+        flash_attn: bool | None = None,
         pad_vocab_multiple: int = 128,
         pad_vocab_power_of_2: bool = False,
     ):
@@ -140,6 +164,7 @@ class GPT:
         self.d_model = d_model
         self.n_heads = n_heads
         self.use_rope = use_rope
+        self.flash_attn = bool(getenv("HK_FLASH_ATTENTION", 1)) if flash_attn is None else flash_attn
 
         self.wte = Tensor.glorot_uniform(self.vocab_size, d_model)
         if use_rope:
@@ -148,7 +173,7 @@ class GPT:
             self.wpe = Tensor.glorot_uniform(max_len, d_model)
             self.freqs_cis = None
 
-        self.h = [Block(d_model, n_heads, d_ff, use_swiglu=use_swiglu, use_rope=use_rope) for _ in range(n_layers)]
+        self.h = [Block(d_model, n_heads, d_ff, use_swiglu=use_swiglu, use_rope=use_rope, flash_attn=self.flash_attn) for _ in range(n_layers)]
         self.rms_f = nn.RMSNorm(d_model)
 
     def reset_cache(self):

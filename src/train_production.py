@@ -44,6 +44,8 @@ try:
 except Exception:
     pass
 
+if "HK_FLASH_ATTENTION" not in os.environ:
+    os.environ["HK_FLASH_ATTENTION"] = "1"
 os.environ["ALLOW_TF32"] = os.environ.get("ALLOW_TF32", str(_preload_config.get("ALLOW_TF32", "1")))
 os.environ["TINYCACHE"] = os.environ.get("TINYCACHE", "1")
 os.environ["HCQ"] = os.environ.get("HCQ", "0")
@@ -297,6 +299,7 @@ def main():
 
     use_swiglu = bool(config.get("USE_SWIGLU", 1))
     use_rope = bool(config.get("USE_ROPE", 1))
+    use_flash_attn = bool(int(os.environ.get("HK_FLASH_ATTENTION", config.get("HK_FLASH_ATTENTION", 1))))
     pad_vocab_mult = int(config.get("PAD_VOCAB_MULTIPLE", 1))
     pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 0))
     use_jit = bool(config.get("JIT", 1))
@@ -323,6 +326,7 @@ def main():
         max_len=max(seq_len, 512),
         use_swiglu=use_swiglu,
         use_rope=use_rope,
+        flash_attn=use_flash_attn,
         pad_vocab_multiple=pad_vocab_mult,
         pad_vocab_power_of_2=pad_vocab_p2,
     )
