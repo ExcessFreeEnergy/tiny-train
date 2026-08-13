@@ -217,6 +217,8 @@ def save_lora_checkpoint(model: GPT, optimizer: AdamW, step: int, ckpt_path: str
 def load_lora_checkpoint(model: GPT, optimizer: AdamW, ckpt_path: str) -> int:
     """Load saved LoRA adapter weights and optimizer state."""
     state = safe_load(ckpt_path)
+    if "freqs_cis" in state:
+        state.pop("freqs_cis")
     load_state_dict(model, state, strict=False)
 
     resumed_step = 0
@@ -404,8 +406,8 @@ def main():
 
     print(f"📦 Loading base model weights from '{args.base_checkpoint}'...", flush=True)
     ckpt_state = safe_load(args.base_checkpoint)
-    base_state = {k: v for k, v in ckpt_state.items() if not k.startswith("opt.") and k != "global_step"}
-    load_state_dict(model, base_state, strict=True)
+    base_state = {k: v for k, v in ckpt_state.items() if not k.startswith("opt.") and k != "global_step" and k != "freqs_cis"}
+    load_state_dict(model, base_state, strict=False)
     print("✅ Pre-trained base weights loaded successfully!", flush=True)
 
     # 3. Apply LoRA Adapters

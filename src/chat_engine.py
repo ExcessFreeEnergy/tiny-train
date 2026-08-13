@@ -271,6 +271,9 @@ class GPTEngineManager:
             pad_vocab_power_of_2=is_power_of_2,
         )
 
+        if "freqs_cis" in state:
+            state.pop("freqs_cis")
+
         load_state_dict(self.model, state, strict=False)
         Tensor.realize(*get_parameters(self.model))
         self.load_time_ms = (time.perf_counter() - t_start) * 1000.0
