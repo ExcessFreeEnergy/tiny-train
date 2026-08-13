@@ -209,6 +209,7 @@ def main():
     )
     parser.add_argument("--patience", type=int, default=None, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
+    parser.add_argument("--curriculum", type=str, default=None, help="Path to curriculum JSON configuration file")
     parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb"], default=None, help="Dataset to train on (tinystories or fineweb)")
     parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
@@ -225,6 +226,29 @@ def main():
         os.environ["DEBUG"] = "0"
 
     config = load_config(args.config)
+
+    # Curriculum Configuration Auto-loading
+    curriculum_path = args.curriculum
+    if not curriculum_path:
+        default_curr = f"conf/curriculum_{args.model_size}.json"
+        if os.path.exists(default_curr):
+            curriculum_path = default_curr
+
+    curriculum_data = None
+    if curriculum_path and os.path.exists(curriculum_path):
+        with open(curriculum_path) as cf:
+            curriculum_data = json.load(cf)
+        print(f"📜 Loaded curriculum configuration: '{curriculum_path}'", flush=True)
+
+    if curriculum_data and "phases" in curriculum_data and len(curriculum_data["phases"]) > 0:
+        # Default active phase settings to Phase 1 initially or calculated total steps
+        p1 = curriculum_data["phases"][0]
+        config["MICRO_BATCH_SIZE"] = p1.get("micro_batch_size", config.get("MICRO_BATCH_SIZE", 16))
+        config["GRAD_ACCUMULATION_STEPS"] = p1.get("grad_accumulation_steps", config.get("GRAD_ACCUMULATION_STEPS", 64))
+        config["SEQUENCE_LENGTH"] = p1.get("sequence_length", config.get("SEQUENCE_LENGTH", 512))
+        total_curr_steps = sum(p.get("steps", 0) for p in curriculum_data["phases"])
+        if total_curr_steps > 0 and args.total_steps == 500: # 500 is default parser value
+            args.total_steps = total_curr_steps
 
     if args.use_llrd is not None:
         use_llrd = args.use_llrd

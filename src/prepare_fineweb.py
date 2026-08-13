@@ -267,7 +267,7 @@ def format_open_platypus_jsonl(parquet_paths: list[str], output_jsonl: str) -> i
 
 def prepare_fineweb(
     target_dir: str,
-    target_tokens: int = 1_000_000_000,
+    target_tokens: int = 2_600_000_000,
     valid_tokens: int = 5_000_000,
     min_count: int = 50,
     force: bool = False,
@@ -528,7 +528,7 @@ def main():
     parser.add_argument("--data-dir", type=str, default=None, help="Target root directory override for dataset output")
     parser.add_argument("--fineweb-dir", type=str, default="data/FineWeb", help="Directory for FineWeb pretraining dataset")
     parser.add_argument("--platypus-dir", type=str, default="data/OpenPlatypus", help="Directory for Open-Platypus dataset")
-    parser.add_argument("--target-tokens", type=int, default=1_000_000_000, help="Target FineWeb train token count (default: 1B)")
+    parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target FineWeb train token count (default: 2.6B)")
     parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target FineWeb valid token count (default: 5M)")
     parser.add_argument("--min-count", type=int, default=50, help="Vocabulary trimming minimum count threshold")
     parser.add_argument("--force", action="store_true", default=False, help="Force dataset re-download and re-tokenization")
