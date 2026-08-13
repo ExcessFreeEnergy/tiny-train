@@ -253,7 +253,7 @@ def main():
     if args.use_llrd is not None:
         use_llrd = args.use_llrd
     else:
-        use_llrd = bool(config.get("USE_LLRD", 1))
+        use_llrd = bool(config.get("USE_LLRD", 0))
 
     llrd_decay = float(args.llrd_decay) if args.llrd_decay is not None else float(config.get("LLRD_DECAY", config.get("LLRD_GAMMA", 0.9)))
 

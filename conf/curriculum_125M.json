@@ -1,30 +1,44 @@
 {
   "model_size": "125M",
   "target_tokens": 2500000000,
+  "total_steps": 19073,
+  "peak_learning_rate": 0.00025,
   "phases": [
     {
       "phase": 1,
-      "name": "Warmup",
+      "name": "Local Syntax",
       "pct": 0.30,
-      "steps": 1430,
+      "steps": 5722,
       "sequence_length": 512,
       "micro_batch_size": 16,
-      "grad_accumulation_steps": 64,
-      "global_sequences_per_step": 1024,
-      "total_tokens_per_step": 524288,
-      "tokens_processed": 749731840
+      "grad_accumulation_steps": 16,
+      "vram_footprint": 8192,
+      "tokens_per_step": 131072,
+      "tokens_processed": 749993984
     },
     {
       "phase": 2,
-      "name": "Main",
-      "pct": 0.70,
-      "steps": 3339,
+      "name": "Paragraph Context",
+      "pct": 0.40,
+      "steps": 7629,
+      "sequence_length": 1024,
+      "micro_batch_size": 8,
+      "grad_accumulation_steps": 16,
+      "vram_footprint": 8192,
+      "tokens_per_step": 131072,
+      "tokens_processed": 999948288
+    },
+    {
+      "phase": 3,
+      "name": "Long-Range Dependencies",
+      "pct": 0.30,
+      "steps": 5722,
       "sequence_length": 2048,
       "micro_batch_size": 4,
-      "grad_accumulation_steps": 64,
-      "global_sequences_per_step": 256,
-      "total_tokens_per_step": 524288,
-      "tokens_processed": 1750597632
+      "grad_accumulation_steps": 16,
+      "vram_footprint": 8192,
+      "tokens_per_step": 131072,
+      "tokens_processed": 749993984
     }
   ]
 }
