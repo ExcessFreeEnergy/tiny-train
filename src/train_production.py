@@ -202,7 +202,7 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500, help="Total training steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-interval", type=int, default=50, help="Steps between validation evaluations")
-    parser.add_argument("--patience", type=int, default=4, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
+    parser.add_argument("--patience", type=int, default=None, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
     parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb"], default=None, help="Dataset to train on (tinystories or fineweb)")
     parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
@@ -229,6 +229,7 @@ def main():
     llrd_decay = float(args.llrd_decay) if args.llrd_decay is not None else float(config.get("LLRD_DECAY", config.get("LLRD_GAMMA", 0.9)))
 
     dataset_name = (args.dataset or config.get("DATASET", "tinystories")).lower()
+    patience = int(args.patience) if args.patience is not None else int(config.get("PATIENCE", 10))
 
     beam_val = str(config.get("BEAM", 2))
     os.environ["BEAM"] = os.environ.get("BEAM", beam_val)
@@ -485,19 +486,19 @@ def main():
             save_checkpoint(model, optimizer, step, ckpt_path)
             print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
 
-            if args.patience > 0:
+            if patience > 0:
                 if val_loss < best_val_loss - 1e-4:
                     best_val_loss = val_loss
                     patience_counter = 0
                 else:
                     patience_counter += 1
                     print(
-                        f"⚠️ Validation loss did not improve (best: {best_val_loss:.4f}). Early stopping patience: {patience_counter}/{args.patience}",
+                        f"⚠️ Validation loss did not improve (best: {best_val_loss:.4f}). Early stopping patience: {patience_counter}/{patience}",
                         flush=True,
                     )
-                    if patience_counter >= args.patience:
+                    if patience_counter >= patience:
                         print(
-                            f"🛑 Early stopping triggered at step {step}: Validation loss failed to improve for {args.patience} consecutive evaluations.",
+                            f"🛑 Early stopping triggered at step {step}: Validation loss failed to improve for {patience} consecutive evaluations.",
                             flush=True,
                         )
                         break
