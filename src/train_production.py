@@ -202,7 +202,9 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500, help="Total training steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-interval", type=int, default=50, help="Steps between validation evaluations")
-    parser.add_argument("--val-steps", "--eval-steps", type=int, default=None, help="Number of micro-batches to evaluate during validation (default: from config or 32)")
+    parser.add_argument(
+        "--val-steps", "--eval-steps", type=int, default=None, help="Number of micro-batches to evaluate during validation (default: from config or 32)"
+    )
     parser.add_argument("--patience", type=int, default=None, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
     parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb"], default=None, help="Dataset to train on (tinystories or fineweb)")
@@ -406,8 +408,10 @@ def main():
 
     # Canonical TinyJit Fused Train Step
     @TinyJit
-    def train_step(x_m: Tensor, y_m: Tensor) -> Tensor:
+    def train_step(x_m: Tensor, y_m: Tensor, lr_tensor: Tensor) -> Tensor:
         optimizer.zero_grad()
+        for opt in optimizer.optimizers:
+            opt.lr.assign((lr_tensor * getattr(opt, "llrd_scale", 1.0)).cast(opt.lr.dtype))
         logits = model.forward(x_m)
         flat_logits = logits.reshape(-1, logits.shape[-1])
         flat_y = y_m.flatten()
@@ -415,7 +419,6 @@ def main():
         (loss * loss_scale).backward()
         return loss.realize(*optimizer.schedule_step())
 
-    @TinyJit
     def val_step(x_m: Tensor, y_m: Tensor) -> Tensor:
         logits = model.forward(x_m)
         flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -429,7 +432,8 @@ def main():
         xw, yw = get_batch(train_data, 100 + w)
         w_x = Tensor(xw[:micro_batch_size], device=params[0].device)
         w_y = Tensor(yw[:micro_batch_size], device=params[0].device)
-        w_loss = train_step(w_x, w_y)
+        w_lr = Tensor([max_lr], device=params[0].device)
+        w_loss = train_step(w_x, w_y, w_lr)
         Device[Device.DEFAULT].synchronize()
         w_loss_val = float(w_loss.cast(dtypes.float).item())
         if math.isnan(w_loss_val) or math.isinf(w_loss_val):
@@ -454,16 +458,14 @@ def main():
     # Production Training Loop
     for step in range(start_step, args.total_steps + 1):
         cur_lr = get_lr_schedule(step, args.total_steps, warmup_iters, max_lr, min_lr)
-        for opt in optimizer.optimizers:
-            opt_lr = cur_lr * getattr(opt, "llrd_scale", 1.0)
-            opt.lr.assign([opt_lr])
+        lr_tensor = Tensor([cur_lr], device=params[0].device)
 
         x_b, y_b = get_batch(train_data, step)
         x_m = Tensor(x_b[:micro_batch_size], device=params[0].device)
         y_m = Tensor(y_b[:micro_batch_size], device=params[0].device)
 
         t0 = time.time()
-        loss_tensor = train_step(x_m, y_m)
+        loss_tensor = train_step(x_m, y_m, lr_tensor)
         Device[Device.DEFAULT].synchronize()
         step_loss = float(loss_tensor.cast(dtypes.float).item())
         t1 = time.time()
@@ -494,6 +496,7 @@ def main():
             eval_tokens = val_steps * micro_batch_size * seq_len
             print(f"📊 Validation Loss at step {step} ({val_steps} steps | {eval_tokens:,} tokens): {val_loss:.4f}", flush=True)
             Tensor.training = True
+            Device[Device.DEFAULT].synchronize()
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")
             save_checkpoint(model, optimizer, step, ckpt_path)
