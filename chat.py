@@ -302,6 +302,7 @@ class TinyChatApp(App):
         checkpoint_path: str | None = None,
         checkpoint_dir: str = "checkpoints",
         use_jit: bool = True,
+        engine=None,
     ):
         super().__init__()
         self.dataset = dataset
@@ -309,6 +310,7 @@ class TinyChatApp(App):
         self.checkpoint_path = checkpoint_path
         self.checkpoint_dir = checkpoint_dir
         self.use_jit = use_jit
+        self.engine = engine
 
         self.manager: GPTEngineManager | None = None
         self.is_generating = False
@@ -354,6 +356,7 @@ class TinyChatApp(App):
                         checkpoint_path=self.checkpoint_path,
                         checkpoint_dir=self.checkpoint_dir,
                         use_jit=self.use_jit,
+                        engine=self.engine,
                     )
                     self.manager = manager
                     self.call_from_thread(self._on_model_loaded_success)

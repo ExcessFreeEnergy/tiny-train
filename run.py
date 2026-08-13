@@ -386,6 +386,7 @@ def main():
             checkpoint_path=ckpt_path,
             checkpoint_dir=args.checkpoint_dir,
             use_jit=not args.no_jit,
+            engine=engine,
         )
         app.run()
     else:

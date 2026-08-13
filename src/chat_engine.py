@@ -201,6 +201,7 @@ class GPTEngineManager:
         checkpoint_dir: str = "checkpoints",
         max_context: int = 1024,
         use_jit: bool = True,
+        engine: GPTEngine | None = None,
     ):
         self.dataset = dataset
         self.model_size = model_size
@@ -230,7 +231,16 @@ class GPTEngineManager:
 
         self.checkpoint_path = checkpoint_path
 
-        # Load weights and detect vocab shape
+        if engine is not None:
+            self.model = engine.model
+            self.engine = engine
+            self.tokenizer = tiktoken.get_encoding("gpt2")
+            self.orig_to_new, self.new_to_orig = load_vocab_map(dataset)
+            self.param_bytes = sum(p.nbytes() for p in get_parameters(self.model))
+            self.num_params = self.model.num_params()
+            self.load_time_ms = 0.0
+            self._warmup_jit()
+            return
         t_start = time.perf_counter()
         state = safe_load(checkpoint_path)
         wte_shape = state["wte"].shape
