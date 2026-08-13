@@ -10,6 +10,7 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
 | **tinygrad FP32 Baseline** | 15M | Naive JIT | 420.0s | 1,086.30 ms | 58.9 | 1.36 TFLOPS | 0.41% | 5.96 |
 | **tinygrad BEAM=4 Initial** | 125M | JIT + BEAM=4 | 2,400.0s | 1,953.14 ms | 65.5 | 13.68 TFLOPS | 4.14% | 5.9411 |
+| 🎯 **tinygrad 65-Step Validation Run (VAL_STEPS=32)** | **125M** | **`@TinyJit` + BEAM=2** | **21.62s** | **213.92 ms** | **598.4** | **114.07 TFLOPS** | **34.57%** | **5.4443** |
 | 👑 **tinygrad Canonical Fused JIT (10-Step Peak)** | **125M** | **`@TinyJit` + BEAM=2** | **20.43s** | **206.65 ms** | **619.4** | **118.08 TFLOPS** | **35.78%** | **6.0938** |
 | 🚀 **tinygrad Post-Audit Winner** | **125M** | **`@TinyJit` + BEAM=2** | **36.42s** | **208.95 ms** | **76.6** | **59.17 TFLOPS** | **17.93%** | **6.1562** |
 | ⚡ **tinygrad Harness Suite (BEAM=4)** | **125M** | **`@TinyJit` + BEAM=4** | **100.45s** | **-** | **-** | **87.02 TFLOPS** | **26.37%** | **N/A (3-step suite)** |
