@@ -22,6 +22,7 @@ Usage Examples:
 """
 
 import argparse
+import gc
 import glob
 import json
 import os
@@ -106,63 +107,81 @@ def get_eos_token_id(tokenizer, user_eos_id: int | None) -> int | None:
     return None
 
 
-def create_file_source(
-    paths: list[str],
+def stream_text_batches(
+    filepath: str,
     file_type: str,
-    separator: str | None,
     json_field: str,
     parquet_column: str,
-    gt_module,
+    separator: str | None,
+    batch_size: int = 5000,
 ):
-    """Create appropriate Gigatoken FileSource object."""
-    if file_type == "text":
-        sep_bytes = separator.encode("utf-8") if separator and separator.lower() != "none" else None
-        return gt_module.TextFileSource(paths, separator=sep_bytes)
+    """Yield lists of document text strings in batches from a file."""
+    if file_type == "parquet":
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(filepath)
+        for batch in pf.iter_batches(batch_size=batch_size, columns=[parquet_column]):
+            raw_list = batch.column(0).to_pylist()
+            text_list = [t if (t is not None and isinstance(t, str)) else "" for t in raw_list]
+            if text_list:
+                yield text_list
     elif file_type == "jsonl":
-        return gt_module.JsonlFileSource(paths, field=json_field)
-    elif file_type == "parquet":
-        return gt_module.ParquetFileSource(paths, column=parquet_column)
+        current_batch = []
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    doc = json.loads(line)
+                    text = doc.get(json_field, "")
+                    if text:
+                        current_batch.append(text)
+                except Exception:
+                    pass
+                if len(current_batch) >= batch_size:
+                    yield current_batch
+                    current_batch = []
+            if current_batch:
+                yield current_batch
     else:
-        raise ValueError(f"Unsupported file type: {file_type}")
+        with open(filepath, encoding="utf-8", errors="replace") as f:
+            if separator and separator.lower() != "none":
+                content = f.read()
+                docs = content.split(separator)
+                for i in range(0, len(docs), batch_size):
+                    chunk = [d.strip() for d in docs[i : i + batch_size] if d.strip()]
+                    if chunk:
+                        yield chunk
+            else:
+                current_batch = []
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        current_batch.append(line)
+                    if len(current_batch) >= batch_size:
+                        yield current_batch
+                        current_batch = []
+                if current_batch:
+                    yield current_batch
 
 
-def flatten_tokens_with_eos(tokens: ak.Array, eos_id: int | None, dtype: np.dtype) -> np.ndarray:
-    """Flatten an awkward array of document tokens into a 1D numpy array, optionally inserting EOS."""
-    doc_lens = ak.to_numpy(ak.num(tokens))
-    num_docs = len(doc_lens)
-    flat_raw = ak.to_numpy(ak.flatten(tokens))
-
-    if eos_id is None:
-        return flat_raw.astype(dtype, copy=False)
-
-    total_tokens = np.sum(doc_lens, dtype=np.int64) + num_docs
-    result = np.full(total_tokens, eos_id, dtype=dtype)
-
-    # Compute output boundaries for vectorized copy
-    ends = np.cumsum(doc_lens + 1)
-    indices = np.ones(total_tokens, dtype=bool)
-    indices[ends - 1] = False
-    result[indices] = flat_raw.astype(dtype, copy=False)
-
-    return result
-
-
-def build_trimmed_vocab_map(
-    flat_tokens: np.ndarray,
+def build_trimmed_vocab_map_from_counts(
+    counts: np.ndarray,
     orig_vocab_size: int,
     always_keep_ids: list[int] | None = None,
     min_count: int = 1,
 ) -> tuple[np.ndarray, dict[int, int]]:
-    """Build a trimmed vocabulary mapping from a 1D array of token IDs.
+    """Build a trimmed vocabulary mapping from token frequency counts.
 
     Returns:
         new_to_orig: 1D uint32 array mapping new token ID -> original token ID
         orig_to_new: dict mapping original token ID -> new token ID
     """
-    max_token_id = int(flat_tokens.max()) if len(flat_tokens) > 0 else 0
-    actual_vocab_size = max(orig_vocab_size, max_token_id + 1)
+    actual_vocab_size = max(orig_vocab_size, len(counts))
+    if len(counts) < actual_vocab_size:
+        counts = np.pad(counts, (0, actual_vocab_size - len(counts)))
 
-    counts = np.bincount(flat_tokens, minlength=actual_vocab_size)
     used_mask = counts >= min_count
 
     if always_keep_ids:
@@ -175,23 +194,41 @@ def build_trimmed_vocab_map(
     return new_to_orig, orig_to_new
 
 
-def remap_tokens_to_trimmed(
-    flat_tokens: np.ndarray,
-    orig_to_new: dict[int, int],
-    orig_vocab_size: int,
+def flatten_and_remap_batch(
+    flat_raw: np.ndarray,
+    doc_lens: np.ndarray,
+    eos_id: int | None,
+    lut: np.ndarray | None,
     target_dtype: np.dtype,
-    fallback_new_id: int = 0,
+    new_eos_id: int = 0,
 ) -> np.ndarray:
-    """Remap tokens from original token IDs to trimmed token IDs using a numpy lookup table."""
-    max_token_id = int(flat_tokens.max()) if len(flat_tokens) > 0 else 0
-    lut_size = max(orig_vocab_size, max_token_id + 1)
+    """Remap tokens and insert EOS token ID per document into a 1D numpy array of target_dtype."""
+    if len(flat_raw) == 0:
+        return np.array([], dtype=target_dtype)
 
-    lut = np.full(lut_size, fallback_new_id, dtype=target_dtype)
-    for orig_id, new_id in orig_to_new.items():
-        if orig_id < lut_size:
-            lut[orig_id] = new_id
+    if lut is not None:
+        lut_size = len(lut)
+        max_id = int(flat_raw.max()) if len(flat_raw) > 0 else 0
+        if max_id >= lut_size:
+            valid_flat = np.where(flat_raw < lut_size, flat_raw, 0)
+            mapped_raw = lut[valid_flat]
+        else:
+            mapped_raw = lut[flat_raw]
+    else:
+        mapped_raw = flat_raw.astype(target_dtype, copy=False)
 
-    return lut[flat_tokens]
+    if eos_id is None:
+        return mapped_raw.astype(target_dtype, copy=False)
+
+    num_docs = len(doc_lens)
+    total_tokens = len(flat_raw) + num_docs
+    result = np.full(total_tokens, new_eos_id, dtype=target_dtype)
+
+    doc_idx = np.repeat(np.arange(num_docs, dtype=np.int64), doc_lens)
+    write_indices = np.arange(len(flat_raw), dtype=np.int64) + doc_idx
+    result[write_indices] = mapped_raw
+
+    return result
 
 
 def save_vocab_map(
@@ -353,17 +390,14 @@ def main():
 
     resolved_paths.sort()
     print(f"Input files ({len(resolved_paths)}):")
-    total_input_bytes = 0
+    total_input_bytes = sum(os.path.getsize(p) for p in resolved_paths)
+    total_input_mb = total_input_bytes / (1024 * 1024)
     for p in resolved_paths[:5]:
         size_mb = os.path.getsize(p) / (1024 * 1024)
-        total_input_bytes += os.path.getsize(p)
         print(f"  - {p} ({size_mb:.2f} MB)")
     if len(resolved_paths) > 5:
         print(f"  ... and {len(resolved_paths) - 5} more files")
-        for p in resolved_paths[5:]:
-            total_input_bytes += os.path.getsize(p)
-
-    total_input_mb = total_input_bytes / (1024 * 1024)
+    print(f"Total input dataset size: {total_input_mb:.2f} MB")
 
     # Determine file type
     file_type = args.file_type
@@ -385,33 +419,6 @@ def main():
     eos_id = get_eos_token_id(tokenizer, args.eos_token_id) if args.add_eos else None
     print(f"Tokenizer loaded in {time.time() - t_start:.2f}s | Vocab size: {vocab_size:,} | EOS Token ID: {eos_id}")
 
-    # Create Gigatoken FileSource
-    source = create_file_source(
-        resolved_paths,
-        file_type=file_type,
-        separator=args.separator,
-        json_field=args.json_field,
-        parquet_column=args.parquet_column,
-        gt_module=gt,
-    )
-
-    # Perform Tokenization
-    print("Tokenizing using Gigatoken rust engine...")
-    t_tok_start = time.time()
-    tokens = tokenizer.encode_files(source)
-    t_tok_end = time.time()
-    tok_duration = t_tok_end - t_tok_start
-
-    num_docs = len(tokens)
-    raw_tok_count = int(ak.sum(ak.num(tokens)))
-    mb_per_sec = total_input_mb / tok_duration if tok_duration > 0 else 0
-    toks_per_sec = raw_tok_count / tok_duration if tok_duration > 0 else 0
-
-    print(f"Tokenization Complete in {tok_duration:.3f}s!")
-    print(f"  - Speed: {mb_per_sec:.2f} MB/s ({toks_per_sec / 1e6:.2f} Mtok/s)")
-    print(f"  - Documents: {num_docs:,}")
-    print(f"  - Tokens (raw): {raw_tok_count:,}")
-
     # Output Format Resolution
     out_format = args.format
     if out_format == "auto":
@@ -423,42 +430,52 @@ def main():
         elif out_ext in [".parquet", ".pq"]:
             out_format = "parquet"
         else:
-            out_format = "bin"  # default to bin
+            out_format = "bin"
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
-    # Flatten tokens
-    flat_arr = flatten_tokens_with_eos(tokens, eos_id if args.add_eos else None, np.uint32)
-    final_tok_count = len(flat_arr)
-
-    # Vocabulary Trimming Handling
     final_vocab_size = vocab_size
     orig_to_new = None
     new_to_orig = None
 
+    # Step 3: Vocabulary Trimming Pass 1 (Streaming)
     if args.vocab_map_in:
         print(f"Applying existing vocabulary map from '{args.vocab_map_in}'...")
         vocab_meta, orig_to_new, new_to_orig = load_vocab_map(args.vocab_map_in)
         final_vocab_size = len(new_to_orig)
-        fallback_new_id = orig_to_new.get(eos_id, 0) if eos_id is not None else 0
-        flat_arr = remap_tokens_to_trimmed(flat_arr, orig_to_new, vocab_size, np.uint32, fallback_new_id=fallback_new_id)
         print(f"  - Trimmed Vocab Size: {final_vocab_size:,} (Original: {vocab_size:,})")
-
     elif args.trim_vocab:
-        print(f"Performing vocabulary trimming (min_count={args.min_count})...")
+        print(f"Performing vocabulary trimming pass across input files (min_count={args.min_count})...")
         t_trim_start = time.time()
-        new_to_orig, orig_to_new = build_trimmed_vocab_map(
-            flat_arr,
+        counts = np.zeros(vocab_size, dtype=np.int64)
+
+        for p in resolved_paths:
+            for text_batch in stream_text_batches(p, file_type=file_type, json_field=args.json_field, parquet_column=args.parquet_column, separator=args.separator, batch_size=5000):
+                if not text_batch:
+                    continue
+                batch_encoded = tokenizer.encode_batch(text_batch)
+                if len(batch_encoded) == 0:
+                    continue
+                flat_file_raw = ak.to_numpy(ak.flatten(batch_encoded))
+                if len(flat_file_raw) > 0:
+                    max_id = int(flat_file_raw.max())
+                    if max_id >= len(counts):
+                        counts = np.pad(counts, (0, max_id + 1 - len(counts)))
+                    counts += np.bincount(flat_file_raw, minlength=len(counts))
+                del batch_encoded, flat_file_raw, text_batch
+            gc.collect()
+
+        new_to_orig, orig_to_new = build_trimmed_vocab_map_from_counts(
+            counts,
             orig_vocab_size=vocab_size,
             always_keep_ids=[eos_id] if eos_id is not None else None,
             min_count=args.min_count,
         )
         final_vocab_size = len(new_to_orig)
         dead_tokens = vocab_size - final_vocab_size
-        reduction_pct = (dead_tokens / vocab_size) * 100.0
-        fallback_new_id = orig_to_new.get(eos_id, 0) if eos_id is not None else 0
-        flat_arr = remap_tokens_to_trimmed(flat_arr, orig_to_new, vocab_size, np.uint32, fallback_new_id=fallback_new_id)
+        reduction_pct = (dead_tokens / vocab_size) * 100.0 if vocab_size > 0 else 0.0
         t_trim_end = time.time()
+
         print(f"Vocabulary Trimming Summary (in {t_trim_end - t_trim_start:.3f}s):")
         print(f"  - Original Vocab Size: {vocab_size:,}")
         print(f"  - Active (Used) Tokens: {final_vocab_size:,}")
@@ -469,28 +486,128 @@ def main():
         map_out_path = args.vocab_map_out or os.path.join(os.path.dirname(os.path.abspath(args.output)), "vocab_map.json")
         save_vocab_map(map_out_path, orig_to_new, new_to_orig, orig_vocab_size=vocab_size, min_count=args.min_count)
 
-    # Target dtype
+    # Determine target dtype
     if args.dtype == "uint16" or (args.dtype == "auto" and final_vocab_size <= 65535):
         target_dtype = np.uint16
     else:
         target_dtype = np.uint32
 
-    flat_arr = flat_arr.astype(target_dtype, copy=False)
+    # Prepare Lookup Table (LUT) for remapping if active
+    lut = None
+    new_eos_id = eos_id if eos_id is not None else 0
+    if orig_to_new is not None:
+        max_orig_id = max(vocab_size, max(orig_to_new.keys()) + 1) if orig_to_new else vocab_size
+        fallback_id = orig_to_new.get(eos_id, 0) if eos_id is not None else 0
+        lut = np.full(max_orig_id, fallback_id, dtype=target_dtype)
+        for orig_id, new_id in orig_to_new.items():
+            if orig_id < max_orig_id:
+                lut[orig_id] = new_id
+        if eos_id is not None:
+            new_eos_id = orig_to_new.get(eos_id, 0)
 
+    # Step 4: Pass 2 - Streaming Tokenization & Export
     print(f"Exporting to '{args.output}' (format: {out_format}, dtype: {target_dtype.__name__})...")
     t_save_start = time.time()
 
-    if out_format == "parquet":
-        # Save awkward array directly (unflatten remapped flat array if trimming applied)
-        if orig_to_new is not None:
-            export_tokens = ak.unflatten(flat_arr, ak.num(tokens))
-        else:
-            export_tokens = tokens
-        ak.to_parquet(export_tokens, args.output)
-    elif out_format == "bin":
-        flat_arr.tofile(args.output)
+    num_docs = 0
+    raw_tok_count = 0
+    final_tok_count = 0
+    first_sample_doc = None
+
+    if out_format == "bin":
+        with open(args.output, "wb") as f_out:
+            for p in resolved_paths:
+                for text_batch in stream_text_batches(p, file_type=file_type, json_field=args.json_field, parquet_column=args.parquet_column, separator=args.separator, batch_size=5000):
+                    if not text_batch:
+                        continue
+                    batch_encoded = tokenizer.encode_batch(text_batch)
+                    if len(batch_encoded) == 0:
+                        continue
+
+                    if first_sample_doc is None:
+                        first_sample_doc = np.array(batch_encoded[0])
+
+                    doc_lens = ak.to_numpy(ak.num(batch_encoded))
+                    flat_raw = ak.to_numpy(ak.flatten(batch_encoded))
+                    raw_tok_count += len(flat_raw)
+                    num_docs += len(doc_lens)
+
+                    chunk_arr = flatten_and_remap_batch(
+                        flat_raw=flat_raw,
+                        doc_lens=doc_lens,
+                        eos_id=eos_id if args.add_eos else None,
+                        lut=lut,
+                        target_dtype=target_dtype,
+                        new_eos_id=new_eos_id,
+                    )
+                    if len(chunk_arr) > 0:
+                        chunk_arr.tofile(f_out)
+                        final_tok_count += len(chunk_arr)
+
+                    del batch_encoded, flat_raw, doc_lens, chunk_arr, text_batch
+                gc.collect()
+
     elif out_format == "npy":
-        np.save(args.output, flat_arr)
+        all_chunks = []
+        for p in resolved_paths:
+            for text_batch in stream_text_batches(p, file_type=file_type, json_field=args.json_field, parquet_column=args.parquet_column, separator=args.separator, batch_size=5000):
+                if not text_batch:
+                    continue
+                batch_encoded = tokenizer.encode_batch(text_batch)
+                if len(batch_encoded) == 0:
+                    continue
+                if first_sample_doc is None:
+                    first_sample_doc = np.array(batch_encoded[0])
+                doc_lens = ak.to_numpy(ak.num(batch_encoded))
+                flat_raw = ak.to_numpy(ak.flatten(batch_encoded))
+                raw_tok_count += len(flat_raw)
+                num_docs += len(doc_lens)
+                chunk_arr = flatten_and_remap_batch(
+                    flat_raw=flat_raw,
+                    doc_lens=doc_lens,
+                    eos_id=eos_id if args.add_eos else None,
+                    lut=lut,
+                    target_dtype=target_dtype,
+                    new_eos_id=new_eos_id,
+                )
+                if len(chunk_arr) > 0:
+                    all_chunks.append(chunk_arr)
+                del batch_encoded, flat_raw, doc_lens, text_batch
+            gc.collect()
+
+        if all_chunks:
+            full_arr = np.concatenate(all_chunks)
+            np.save(args.output, full_arr)
+            final_tok_count = len(full_arr)
+
+    elif out_format == "parquet":
+        remapped_docs_list = []
+        for p in resolved_paths:
+            for text_batch in stream_text_batches(p, file_type=file_type, json_field=args.json_field, parquet_column=args.parquet_column, separator=args.separator, batch_size=5000):
+                if not text_batch:
+                    continue
+                batch_encoded = tokenizer.encode_batch(text_batch)
+                if len(batch_encoded) == 0:
+                    continue
+                if first_sample_doc is None:
+                    first_sample_doc = np.array(batch_encoded[0])
+                doc_lens = ak.to_numpy(ak.num(batch_encoded))
+                flat_raw = ak.to_numpy(ak.flatten(batch_encoded))
+                raw_tok_count += len(flat_raw)
+                num_docs += len(doc_lens)
+                if lut is not None:
+                    for doc in batch_encoded:
+                        doc_np = ak.to_numpy(doc)
+                        valid_doc = np.where(doc_np < len(lut), doc_np, 0)
+                        remapped_docs_list.append(lut[valid_doc])
+                else:
+                    for doc in batch_encoded:
+                        remapped_docs_list.append(ak.to_numpy(doc).astype(target_dtype, copy=False))
+                del batch_encoded, flat_raw, doc_lens, text_batch
+            gc.collect()
+        export_tokens = ak.Array(remapped_docs_list)
+        ak.to_parquet(export_tokens, args.output)
+        final_tok_count = int(ak.sum(ak.num(export_tokens)))
 
     t_save_end = time.time()
     out_size_mb = os.path.getsize(args.output) / (1024 * 1024)
@@ -498,10 +615,12 @@ def main():
     print(f"  - Final output path: {args.output}")
     print(f"  - Output size: {out_size_mb:.2f} MB")
     print(f"  - Total token count: {final_tok_count:,}")
+    print(f"  - Documents: {num_docs:,}")
+    print(f"  - Raw tokens: {raw_tok_count:,}")
 
     # Decoded sanity check
-    if num_docs > 0:
-        sample_doc = tokens[0]
+    if first_sample_doc is not None and len(first_sample_doc) > 0:
+        sample_doc = first_sample_doc
         sample_text = tokenizer.decode(sample_doc)
         print("\n--- Decoded Sample Check (Doc 1) ---")
         preview = sample_text[:200].decode("utf-8", errors="replace")
@@ -509,8 +628,7 @@ def main():
         if orig_to_new is not None:
             trimmed_sample = [orig_to_new.get(int(tok), 0) for tok in sample_doc[:10]]
             print(f"Trimmed Tokens (first 10):  {trimmed_sample}")
-            # Verify inverse mapping decodes back perfectly
-            recovered = [int(new_to_orig[tok]) for tok in trimmed_sample]
+            recovered = [int(new_to_orig[tok]) for tok in trimmed_sample if tok < len(new_to_orig)]
             decoded_back = tokenizer.decode(recovered).decode("utf-8", errors="replace")
             print(f"Decoded back from trimmed:  {decoded_back[:100]!r}...")
         else:
@@ -520,3 +638,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

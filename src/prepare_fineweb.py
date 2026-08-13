@@ -349,12 +349,17 @@ def prepare_fineweb(
     print(f"\nSplitting into train_trimmed.bin ({target_tokens:,} tokens) and valid_trimmed.bin ({valid_tokens:,} tokens)...", flush=True)
 
     train_mmap = np.memmap(train_bin, dtype=np.uint16, mode="w+", shape=(target_tokens,))
-    train_mmap[:] = full_data[:target_tokens]
+    chunk_size = 50_000_000
+    for offset in range(0, target_tokens, chunk_size):
+        end = min(offset + chunk_size, target_tokens)
+        train_mmap[offset:end] = full_data[offset:end]
     train_mmap.flush()
     del train_mmap
 
     valid_mmap = np.memmap(valid_bin, dtype=np.uint16, mode="w+", shape=(valid_tokens,))
-    valid_mmap[:] = full_data[target_tokens : target_tokens + valid_tokens]
+    for offset in range(0, valid_tokens, chunk_size):
+        end = min(offset + chunk_size, valid_tokens)
+        valid_mmap[offset:end] = full_data[target_tokens + offset : target_tokens + end]
     valid_mmap.flush()
     del valid_mmap
 
@@ -472,12 +477,17 @@ def prepare_open_platypus(
     print(f"\nSplitting into train_trimmed.bin ({train_tokens:,} tokens) and valid_trimmed.bin ({valid_tokens:,} tokens)...", flush=True)
 
     train_mmap = np.memmap(train_bin, dtype=np.uint16, mode="w+", shape=(train_tokens,))
-    train_mmap[:] = full_data[:train_tokens]
+    chunk_size = 50_000_000
+    for offset in range(0, train_tokens, chunk_size):
+        end = min(offset + chunk_size, train_tokens)
+        train_mmap[offset:end] = full_data[offset:end]
     train_mmap.flush()
     del train_mmap
 
     valid_mmap = np.memmap(valid_bin, dtype=np.uint16, mode="w+", shape=(valid_tokens,))
-    valid_mmap[:] = full_data[train_tokens:]
+    for offset in range(0, valid_tokens, chunk_size):
+        end = min(offset + chunk_size, valid_tokens)
+        valid_mmap[offset:end] = full_data[train_tokens + offset : train_tokens + end]
     valid_mmap.flush()
     del valid_mmap
 
