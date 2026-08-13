@@ -366,6 +366,9 @@ def main():
         pad_vocab_power_of_2=is_power_of_2,
     )
 
+    if "freqs_cis" in state:
+        state.pop("freqs_cis")
+
     load_state_dict(model, state, strict=False)
     Tensor.realize(*get_parameters(model))
     t_load_ms = (time.perf_counter() - t_load_start) * 1000.0
