@@ -1,6 +1,6 @@
 [project]
 name = "tiny-train"
-version = "0.1.0"
+version = "1.0.0"
 description = "High-Performance Tinygrad 15M Parameter Transformer Training Harness"
 requires-python = ">=3.11"
 dependencies = [
