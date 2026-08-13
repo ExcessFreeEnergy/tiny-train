@@ -202,6 +202,7 @@ def main():
     parser.add_argument("--total-steps", type=int, default=500, help="Total training steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-interval", type=int, default=50, help="Steps between validation evaluations")
+    parser.add_argument("--val-steps", "--eval-steps", type=int, default=None, help="Number of micro-batches to evaluate during validation (default: from config or 32)")
     parser.add_argument("--patience", type=int, default=None, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
     parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb"], default=None, help="Dataset to train on (tinystories or fineweb)")
@@ -230,6 +231,7 @@ def main():
 
     dataset_name = (args.dataset or config.get("DATASET", "tinystories")).lower()
     patience = int(args.patience) if args.patience is not None else int(config.get("PATIENCE", 10))
+    val_steps = int(args.val_steps) if args.val_steps is not None else int(config.get("VAL_STEPS", 32))
 
     beam_val = str(config.get("BEAM", 2))
     os.environ["BEAM"] = os.environ.get("BEAM", beam_val)
@@ -413,6 +415,13 @@ def main():
         (loss * loss_scale).backward()
         return loss.realize(*optimizer.schedule_step())
 
+    @TinyJit
+    def val_step(x_m: Tensor, y_m: Tensor) -> Tensor:
+        logits = model.forward(x_m)
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_y = y_m.flatten()
+        return flat_logits.sparse_categorical_crossentropy(flat_y).realize()
+
     # JIT compilation warmup
     sys.stderr.write("[train_production.py] Running JIT compilation warmup steps...\n")
     w_start = time.time()
@@ -473,13 +482,17 @@ def main():
         # Checkpointing & Validation Eval
         if step % args.eval_interval == 0 or step == args.total_steps:
             Tensor.training = False
-            x_v, y_v = get_batch(valid_data, step + 999)
-            val_logits = model.forward(Tensor(x_v[:micro_batch_size], device=params[0].device))
-            flat_val_logits = val_logits.reshape(-1, val_logits.shape[-1])
-            flat_val_y = Tensor(y_v[:micro_batch_size], device=params[0].device).flatten()
-            val_loss_tensor = flat_val_logits.sparse_categorical_crossentropy(flat_val_y).realize()
-            val_loss = float(val_loss_tensor.cast(dtypes.float).item())
-            print(f"📊 Validation Loss at step {step}: {val_loss:.4f}", flush=True)
+            total_val_loss = 0.0
+            for v_idx in range(val_steps):
+                x_v, y_v = get_batch(valid_data, step * val_steps + v_idx + 1000)
+                x_v_tensor = Tensor(x_v[:micro_batch_size], device=params[0].device)
+                y_v_tensor = Tensor(y_v[:micro_batch_size], device=params[0].device)
+                v_loss_tensor = val_step(x_v_tensor, y_v_tensor)
+                total_val_loss += float(v_loss_tensor.cast(dtypes.float).item())
+
+            val_loss = total_val_loss / val_steps
+            eval_tokens = val_steps * micro_batch_size * seq_len
+            print(f"📊 Validation Loss at step {step} ({val_steps} steps | {eval_tokens:,} tokens): {val_loss:.4f}", flush=True)
             Tensor.training = True
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")
@@ -531,6 +544,9 @@ def main():
         "grad_accumulation_steps": grad_accum_steps,
         "effective_batch_size": eff_batch_size,
         "padded_vocab_size": model.vocab_size,
+        "val_loss": round(val_loss, 4) if "val_loss" in locals() else None,
+        "val_steps": val_steps,
+        "val_tokens": val_steps * micro_batch_size * seq_len,
     }
 
     print("\n=======================================================", flush=True)
