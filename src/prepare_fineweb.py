@@ -123,17 +123,19 @@ def remediate_dataset(data_dir: str):
 def download_fineweb_shards(raw_dir: str, target_tokens: int = 1_005_000_000) -> list[str]:
     """Download FineWeb sample-10BT parquet shards until target token count is reachable."""
     os.makedirs(raw_dir, exist_ok=True)
+    # Estimate ~650M tokens per parquet shard in sample/10BT
+    needed_shards = max(2, int(np.ceil(target_tokens / 650_000_000)))
 
     existing_parquets = glob.glob(os.path.join(raw_dir, "**/*.parquet"), recursive=True)
     valid_parquets = [p for p in existing_parquets if os.path.exists(p) and os.path.getsize(p) > 0]
-    if len(valid_parquets) >= 2:
-        print(f"Found {len(valid_parquets)} existing parquet shard(s) in {raw_dir}:", flush=True)
+    if len(valid_parquets) >= needed_shards:
+        print(f"Found {len(valid_parquets)} existing parquet shard(s) in {raw_dir} (needed {needed_shards}):", flush=True)
         for p in valid_parquets:
             sz_mb = os.path.getsize(p) / (1024**2)
             print(f"  - {p} ({sz_mb:.1f} MB)", flush=True)
         return valid_parquets
 
-    print("🔍 Fetching shard list from HuggingFaceFW/fineweb (sample-10BT)...", flush=True)
+    print(f"🔍 Fetching shard list from HuggingFaceFW/fineweb (sample-10BT) for {target_tokens:,} target tokens ({needed_shards} shards needed)...", flush=True)
     api = HfApi()
     files = api.list_repo_files(repo_id="HuggingFaceFW/fineweb", repo_type="dataset")
     shards = sorted([f for f in files if f.startswith("sample/10BT/") and f.endswith(".parquet")])
@@ -152,7 +154,7 @@ def download_fineweb_shards(raw_dir: str, target_tokens: int = 1_005_000_000) ->
             print(f"  - Shard already exists: {actual_path} ({os.path.getsize(actual_path) / (1024**2):.1f} MB)", flush=True)
             downloaded_files.append(actual_path)
         else:
-            print(f"  - Downloading shard [{len(downloaded_files) + 1}/2]: {filename}...", flush=True)
+            print(f"  - Downloading shard [{len(downloaded_files) + 1}/{needed_shards}]: {filename}...", flush=True)
             t0 = time.time()
             downloaded_file = hf_hub_download(
                 repo_id="HuggingFaceFW/fineweb",
@@ -165,8 +167,8 @@ def download_fineweb_shards(raw_dir: str, target_tokens: int = 1_005_000_000) ->
             print(f"    Downloaded in {dt:.2f}s ({sz_mb:.1f} MB)", flush=True)
             downloaded_files.append(downloaded_file)
 
-        if len(downloaded_files) >= 2:
-            print(f"Downloaded {len(downloaded_files)} shards (~1.44B tokens estimated).", flush=True)
+        if len(downloaded_files) >= needed_shards:
+            print(f"Downloaded {len(downloaded_files)} shards (~{len(downloaded_files) * 650}M tokens estimated).", flush=True)
             break
 
     return downloaded_files
