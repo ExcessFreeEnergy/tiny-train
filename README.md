@@ -5,7 +5,7 @@ High-performance, hardware-optimized Transformer model training and inference en
 ## Objectives & Target Performance
 
 - **Target Model Architecture**: 125M Parameter Transformer (`d_model=768`, `n_layers=12`, `n_heads=12`, `d_ff=3072`, `vocab_size=14,080` padded).
-- **End Goal**: Complete a **1 Billion token** training run in **under 4 hours** (< 240 minutes).
+- **End Goal**: Complete a **2.6 Billion token** Chinchilla-optimal pre-training run on FineWeb across 3 curriculum phases.
 
 ---
 
@@ -22,9 +22,9 @@ High-performance, hardware-optimized Transformer model training and inference en
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. MAIN PRODUCTION TRAINER (Stage 2: src/train_production.py)│
-│    ├── Loads conf/best_config.json                          │
+│    ├── Auto-loads conf/curriculum_125M.json (3-Phase Plan)  │
 │    ├── Streams dataset via np.memmap                        │
-│    ├── Cosine LR Decay + Warmup Schedule                    │
+│    ├── Global Cosine LR Decay Schedule                      │
 │    └── Safetensors Checkpointing & Validation Loss Evaluation │
 └──────────────────────────────┬──────────────────────────────┘
                                │ Checkpoints safetensors
@@ -82,12 +82,15 @@ uv sync
 ./lint.sh
 ```
 
-### 2. Main Production Trainer (`src/train_production.py`)
+### 2. Full Production Training Run (125M with Curriculum on FineWeb 2.6B Tokens)
 
-Run `src/train_production.py` to train the 125M (or 15M) parameter Transformer model:
+To launch the full 2.6 Billion token Chinchilla-optimal pre-training run (19,073 steps) with `conf/curriculum_125M.json`:
+
 ```bash
-uv run python src/train_production.py --model-size 125M
+BEAM=2 uv run python src/train_production.py --model-size 125M --dataset fineweb --config conf/config.json 2>&1 | tee logs/training_125M_curriculum.log
 ```
+
+---
 
 ### 3. Stage 1: Harness Optimization Suite (`src/harness.py`)
 
@@ -125,12 +128,6 @@ python src/harness.py --sweep-batch
 python src/harness.py
 ```
 
-### 4. Stage 2: Production Model Training (`src/train_production.py`)
-
-To launch a full production training run using `conf/best_config.json`:
-
-```bash
-# Train 125M Model (500 steps default)
 uv run python src/train_production.py --model-size 125M --total-steps 500
 
 # Specify custom checkpoint directory and eval interval

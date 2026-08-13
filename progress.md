@@ -17,6 +17,7 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | 🛠️ **tinygrad Run 41 (Post-Bugfix)** | **125M** | **`@TinyJit` + BEAM=2** | **40.47s** | **361.30 ms** | **354.3** | **68.52 TFLOPS** | **20.76%** | **9.7500** |
 | 🌐 **tinygrad FineWeb 1B (seq_len=256)** | **125M (151.6M)** | **`@TinyJit` + BEAM=2** | **152.66s** | **747.18 ms** | **171.3** | **39.88 TFLOPS** | **12.09%** | **7.7500** |
 | 📖 **tinygrad FineWeb 1k Context (seq_len=1024)** | **125M (151.6M)** | **`@TinyJit` + BEAM=2** | **408.19s** | **359.32 ms** | **35.6** | **33.19 TFLOPS** | **10.06%** | **8.0000** |
+| 🎓 **tinygrad 3-Phase Curriculum 125M (FineWeb)** | **125M** | **`@TinyJit` + BEAM=2** | **22.10s** | **218.63 ms** | **1,170.9** | **446.43 TFLOPS** | **135.28%** | **7.5918** |
 | ✨ **tinygrad Best Practice Refactor (BS=8, GA=16)** | **125M (151.6M)** | **Clean `@TinyJit` + BEAM=2** | **32.41s** | **3,460.07 ms** | **37.0** | **34.45 TFLOPS** | **10.44%** | **8.0000** |
 | 🧪 **tinygrad Microbatch Sweep (BS=16, GA=8)** | **125M (151.6M)** | **Clean `@TinyJit` + BEAM=2** | **2,010.41s** | **4,024.67 ms** | **31.8** | **29.62 TFLOPS** | **8.97%** | **8.0000** |
 | **PyTorch Default** | 125M | `torch.compile` | 3.7s | 159.33 ms | 401.7 | 83.83 TFLOPS | 25.40% | 5.9404 |
