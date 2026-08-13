@@ -96,4 +96,7 @@ uv run python src/harness.py --run-suite
 
 # 2. Stage 2 (Main Production Trainer): Loads conf/best_config.json, streaming dataset tokens via np.memmap, applying Cosine LR schedule with Warmup, evaluating validation loss, and saving .safetensors checkpoints:
 uv run python src/train_production.py --model-size 125M
+
+# 3. LoRA Fine-Tuning Engine (src/finetune.py): Fine-tunes pre-trained 125M checkpoint on Open-Platypus dataset, saving adapter checkpoints and exporting fused standalone model:
+uv run python src/finetune.py --base-checkpoint checkpoints/model_125m_step_5500.safetensors --epochs 2 --eval-interval 100 --checkpoint-dir checkpoints_finetuned
 ```

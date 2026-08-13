@@ -292,7 +292,7 @@ def main():
 
     use_swiglu = bool(config.get("USE_SWIGLU", 1))
     use_rope = bool(config.get("USE_ROPE", 1))
-    pad_vocab_mult = int(config.get("PAD_VOCAB_MULTIPLE", 128))
+    pad_vocab_mult = int(config.get("PAD_VOCAB_MULTIPLE", 1))
     pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 0))
     use_jit = bool(config.get("JIT", 1))
 
@@ -355,12 +355,7 @@ def main():
         x.replace(x.contiguous())
     Tensor.realize(*params)
 
-    # Pre-allocate gradient accumulation buffers directly for JIT capturing
-    for p in params:
-        p.accum_grad = Tensor.zeros_like(p).realize()
-
     weight_decay = float(config.get("WEIGHT_DECAY", 0.01))
-    max_grad_norm = float(config.get("MAX_GRAD_NORM", 1.0))
 
     optimizer, llrd_info = build_optimizer(model, max_lr, weight_decay, use_llrd, llrd_decay)
 
@@ -406,65 +401,29 @@ def main():
         y_np = chunk[1:].reshape(eff_batch_size, seq_len)
         return x_np, y_np
 
-    # Best Practice Microbatch Accumulation Function returning assign nodes so TinyJit captures graph
-    def accum_step(x_micro: Tensor, y_micro: Tensor):
-        logits = model.forward(x_micro)
+    # Canonical TinyJit Fused Train Step
+    @TinyJit
+    def train_step(x_m: Tensor, y_m: Tensor) -> Tensor:
+        optimizer.zero_grad()
+        logits = model.forward(x_m)
         flat_logits = logits.reshape(-1, logits.shape[-1])
-        flat_y = y_micro.flatten()
-        chunk_loss = flat_logits.sparse_categorical_crossentropy(flat_y) / grad_accum_steps
-        (chunk_loss * loss_scale).backward()
-        accum_nodes = []
-        for p in params:
-            if p.grad is not None:
-                accum_nodes.append(p.accum_grad.assign(p.accum_grad + p.grad.cast(p.accum_grad.dtype)))
-                p.grad = None
-        return chunk_loss, *accum_nodes
-
-    # Best Practice Optimizer Function using p.accum_grad
-    def opt_step():
-        for p in params:
-            p.grad = p.accum_grad
-
-        if max_grad_norm > 0:
-            grads = [p.grad for p in params if p.grad is not None]
-            if grads:
-                total_norm_sq = sum((g.cast(dtypes.float32) ** 2).sum() for g in grads)
-                global_norm = total_norm_sq.sqrt()
-                clip_coeff = (max_grad_norm / (global_norm + 1e-6)).clip(max_=1.0)
-                for p in params:
-                    if p.grad is not None:
-                        p.grad = p.grad * clip_coeff
-
-        opt_nodes = optimizer.schedule_step()
-        wipe_nodes = [p.accum_grad.assign(Tensor.zeros_like(p.accum_grad)) for p in params]
-        for p in params:
-            p.grad = None
-        return *opt_nodes, *wipe_nodes
-
-    if use_jit:
-        accum_fn = TinyJit(accum_step)
-        opt_fn = TinyJit(opt_step)
-    else:
-        accum_fn = accum_step
-        opt_fn = opt_step
+        flat_y = y_m.flatten()
+        loss = flat_logits.sparse_categorical_crossentropy(flat_y)
+        (loss * loss_scale).backward()
+        return loss.realize(*optimizer.schedule_step())
 
     # JIT compilation warmup
     sys.stderr.write("[train_production.py] Running JIT compilation warmup steps...\n")
     w_start = time.time()
     for w in range(2):
         xw, yw = get_batch(train_data, 100 + w)
-        w_last_loss = None
-        for i in range(grad_accum_steps):
-            x_m = Tensor(xw[i * micro_batch_size : (i + 1) * micro_batch_size], device=params[0].device)
-            y_m = Tensor(yw[i * micro_batch_size : (i + 1) * micro_batch_size], device=params[0].device)
-            w_res = accum_fn(x_m, y_m)
-            w_last_loss = w_res[0]
-        _ = opt_fn()
+        w_x = Tensor(xw[:micro_batch_size], device=params[0].device)
+        w_y = Tensor(yw[:micro_batch_size], device=params[0].device)
+        w_loss = train_step(w_x, w_y)
         Device[Device.DEFAULT].synchronize()
-        if w_last_loss is not None:
-            w_loss_val = float(w_last_loss.cast(dtypes.float).item())
-            if math.isnan(w_loss_val) or math.isinf(w_loss_val):
-                raise RuntimeError(f"JIT warmup step {w + 1} produced invalid loss: {w_loss_val}")
+        w_loss_val = float(w_loss.cast(dtypes.float).item())
+        if math.isnan(w_loss_val) or math.isinf(w_loss_val):
+            raise RuntimeError(f"JIT warmup step {w + 1} produced invalid loss: {w_loss_val}")
 
     if ckpt_path_to_load:
         _ = load_checkpoint(model, optimizer, ckpt_path_to_load)
@@ -487,22 +446,16 @@ def main():
         cur_lr = get_lr_schedule(step, args.total_steps, warmup_iters, max_lr, min_lr)
         for opt in optimizer.optimizers:
             opt_lr = cur_lr * getattr(opt, "llrd_scale", 1.0)
-            opt.lr.assign([opt_lr]).realize()
+            opt.lr.assign([opt_lr])
 
         x_b, y_b = get_batch(train_data, step)
+        x_m = Tensor(x_b[:micro_batch_size], device=params[0].device)
+        y_m = Tensor(y_b[:micro_batch_size], device=params[0].device)
 
         t0 = time.time()
-        step_loss_tensor = Tensor.zeros((), dtype=dtypes.float, device=params[0].device)
-        for i in range(grad_accum_steps):
-            x_m = Tensor(x_b[i * micro_batch_size : (i + 1) * micro_batch_size], device=params[0].device)
-            y_m = Tensor(y_b[i * micro_batch_size : (i + 1) * micro_batch_size], device=params[0].device)
-            res_micro = accum_fn(x_m, y_m)
-            loss_micro = res_micro[0]
-            step_loss_tensor = step_loss_tensor + loss_micro
-
-        _ = opt_fn()
+        loss_tensor = train_step(x_m, y_m)
         Device[Device.DEFAULT].synchronize()
-        step_loss = float(step_loss_tensor.cast(dtypes.float).item())
+        step_loss = float(loss_tensor.cast(dtypes.float).item())
         t1 = time.time()
 
         step_ms = (t1 - t0) * 1000.0

@@ -56,19 +56,35 @@ def load_vocab_map(dataset_name: str = "tinystories", vocab_map_path: str | None
 
 
 def find_latest_checkpoint(checkpoint_dir: str, model_size: str) -> str | None:
-    """Scan checkpoint directory for highest step count matching model scale."""
-    if not os.path.exists(checkpoint_dir):
+    """Scan checkpoint directory for fine-tuned or highest step count model matching model scale."""
+    search_dirs = []
+    if os.path.exists(checkpoint_dir):
+        search_dirs.append(checkpoint_dir)
+
+    finetuned_dir = os.path.join(os.path.dirname(__file__), "checkpoints_finetuned")
+    if os.path.exists(finetuned_dir) and finetuned_dir not in search_dirs:
+        search_dirs.append(finetuned_dir)
+
+    if not search_dirs:
         return None
+
+    # Prioritize fused fine-tuned checkpoint if present
+    for sdir in search_dirs:
+        fused_ckpt = os.path.join(sdir, f"model_{model_size.lower()}_finetuned.safetensors")
+        if os.path.exists(fused_ckpt):
+            return fused_ckpt
+
     pattern = re.compile(rf"model_{model_size.lower()}_step_(\d+)\.safetensors$")
     max_step = -1
     best_ckpt = None
-    for filename in os.listdir(checkpoint_dir):
-        match = pattern.match(filename)
-        if match:
-            s = int(match.group(1))
-            if s > max_step:
-                max_step = s
-                best_ckpt = os.path.join(checkpoint_dir, filename)
+    for sdir in search_dirs:
+        for filename in os.listdir(sdir):
+            match = pattern.match(filename)
+            if match:
+                s = int(match.group(1))
+                if s > max_step:
+                    max_step = s
+                    best_ckpt = os.path.join(sdir, filename)
     return best_ckpt
 
 
