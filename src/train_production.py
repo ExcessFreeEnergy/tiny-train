@@ -517,8 +517,9 @@ def main():
     _ = val_step(w_vx_tensor, w_vy_tensor)
     Device[Device.DEFAULT].synchronize()
 
-    if ckpt_path_to_load:
-        _ = load_checkpoint(model, optimizer, ckpt_path_to_load)
+    init_ckpt = ckpt_path_to_load or args.init_weights_path
+    if init_ckpt:
+        _ = load_checkpoint(model, optimizer, init_ckpt)
         Tensor.realize(*params)
         for opt in optimizer.optimizers:
             Tensor.realize(*opt.m, *opt.v, opt.b1_t, opt.b2_t)
