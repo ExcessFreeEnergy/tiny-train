@@ -122,8 +122,13 @@ def remediate_dataset(data_dir: str):
 def download_fineweb_shards(raw_dir: str, target_tokens: int = 2_605_000_000, repo_id: str = "HuggingFaceFW/fineweb") -> list[str]:
     """Download FineWeb or FineWeb-Edu parquet shards until target token count is reachable."""
     os.makedirs(raw_dir, exist_ok=True)
-    # Estimate ~275M tokens per shard for Cosmopedia-v2, ~650M for FineWeb
-    tokens_per_shard = 275_000_000 if "cosmopedia" in repo_id.lower() else 650_000_000
+    # Estimate ~120M tokens per shard for BookCorpus, ~275M for Cosmopedia-v2, ~650M for FineWeb
+    if "bookcorpus" in repo_id.lower():
+        tokens_per_shard = 120_000_000
+    elif "cosmopedia" in repo_id.lower():
+        tokens_per_shard = 275_000_000
+    else:
+        tokens_per_shard = 650_000_000
     needed_shards = max(2, int(np.ceil(target_tokens / tokens_per_shard)))
 
     existing_parquets = glob.glob(os.path.join(raw_dir, "**/*.parquet"), recursive=True)
