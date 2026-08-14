@@ -578,8 +578,9 @@ def prepare_custom_blend(
             force=force,
         )
 
+    bc_vocab_map = os.path.join(bookcorpus_dir, "vocab_map.json")
     if not verify_dataset(fineweb_edu_dir, min_train_tokens=1_000_000, min_valid_tokens=1_000):
-        print("⚡ FineWeb-Edu source dataset missing or incomplete. Triggering preparation...", flush=True)
+        print("⚡ FineWeb-Edu source dataset missing or incomplete. Triggering aligned preparation...", flush=True)
         prepare_pretraining_dataset(
             target_dir=fineweb_edu_dir,
             repo_id="HuggingFaceFW/fineweb-edu",
@@ -587,6 +588,7 @@ def prepare_custom_blend(
             target_tokens=2_600_000_000,
             valid_tokens=5_000_000,
             force=force,
+            vocab_map_in=bc_vocab_map if os.path.exists(bc_vocab_map) else None,
         )
 
     os.makedirs(target_dir, exist_ok=True)
