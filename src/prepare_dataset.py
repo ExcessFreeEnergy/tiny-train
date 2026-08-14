@@ -543,12 +543,127 @@ def prepare_open_platypus(
     print(f"  - Vocab Map:     '{vocab_map}'")
 
 
+def prepare_custom_blend(
+    target_dir: str = "data/BookCorpusFineWebEdu",
+    bookcorpus_dir: str = "data/BookCorpus",
+    fineweb_edu_dir: str = "data/FineWebEdu",
+    target_train_tokens: int = 2_600_000_000,
+    target_valid_tokens: int = 5_000_000,
+    bookcorpus_ratio: float = 0.70,
+    force: bool = False,
+):
+    """Combine ~70% BookCorpus and ~30% FineWeb-Edu tokens to form a 2.6B token pretraining dataset."""
+    target_dir = os.path.abspath(target_dir)
+    print("\n=== Custom Blend Dataset Pipeline (~70% BookCorpus / ~30% FineWeb-Edu) ===")
+    print(f"Target Directory: {target_dir}")
+    print(f"Target Train Tokens: {target_train_tokens:,}")
+    print(f"Target Valid Tokens: {target_valid_tokens:,}\n")
+
+    if not force and verify_dataset(target_dir, min_train_tokens=target_train_tokens, min_valid_tokens=target_valid_tokens):
+        print(f"[OK] Dataset 'BookCorpusFineWebEdu' in '{target_dir}' verified and ready to consume! Skipping generation.", flush=True)
+        return
+
+    # Ensure source datasets are prepared
+    if not verify_dataset(bookcorpus_dir, min_train_tokens=1_000_000, min_valid_tokens=1_000):
+        print("⚡ BookCorpus source dataset missing or incomplete. Triggering preparation...", flush=True)
+        prepare_pretraining_dataset(
+            target_dir=bookcorpus_dir,
+            repo_id="lucadiliello/bookcorpusopen",
+            dataset_name="BookCorpus",
+            target_tokens=2_600_000_000,
+            valid_tokens=5_000_000,
+            force=force,
+        )
+
+    if not verify_dataset(fineweb_edu_dir, min_train_tokens=1_000_000, min_valid_tokens=1_000):
+        print("⚡ FineWeb-Edu source dataset missing or incomplete. Triggering preparation...", flush=True)
+        prepare_pretraining_dataset(
+            target_dir=fineweb_edu_dir,
+            repo_id="HuggingFaceFW/fineweb-edu",
+            dataset_name="FineWeb-Edu",
+            target_tokens=2_600_000_000,
+            valid_tokens=5_000_000,
+            force=force,
+        )
+
+    os.makedirs(target_dir, exist_ok=True)
+    remediate_dataset(target_dir)
+
+    bc_train_path = os.path.join(bookcorpus_dir, "train_trimmed.bin")
+    if not os.path.exists(bc_train_path):
+        bc_train_path = os.path.join(bookcorpus_dir, "train.bin")
+
+    fe_train_path = os.path.join(fineweb_edu_dir, "train_trimmed.bin")
+    if not os.path.exists(fe_train_path):
+        fe_train_path = os.path.join(fineweb_edu_dir, "train.bin")
+
+    fe_vocab_map = os.path.join(fineweb_edu_dir, "vocab_map.json")
+    target_vocab_map = os.path.join(target_dir, "vocab_map.json")
+    if os.path.exists(fe_vocab_map):
+        shutil.copy(fe_vocab_map, target_vocab_map)
+
+    bc_mmap = np.memmap(bc_train_path, dtype=np.uint16, mode="r")
+    fe_mmap = np.memmap(fe_train_path, dtype=np.uint16, mode="r")
+
+    bc_req = int(target_train_tokens * bookcorpus_ratio)
+    fe_req = target_train_tokens - bc_req
+
+    bc_count = min(len(bc_mmap), bc_req)
+    fe_count = min(len(fe_mmap), fe_req)
+
+    actual_train_tokens = bc_count + fe_count
+    print(f"Blending {bc_count:,} BookCorpus tokens + {fe_count:,} FineWeb-Edu tokens = {actual_train_tokens:,} total train tokens...", flush=True)
+
+    train_bin = os.path.join(target_dir, "train_trimmed.bin")
+    train_fallback = os.path.join(target_dir, "train.bin")
+
+    out_mmap = np.memmap(train_bin, dtype=np.uint16, mode="w+", shape=(actual_train_tokens,))
+
+    chunk_size = 50_000_000
+    for offset in range(0, bc_count, chunk_size):
+        end = min(offset + chunk_size, bc_count)
+        out_mmap[offset:end] = bc_mmap[offset:end]
+
+    for offset in range(0, fe_count, chunk_size):
+        end = min(offset + chunk_size, fe_count)
+        out_mmap[bc_count + offset : bc_count + end] = fe_mmap[offset:end]
+
+    out_mmap.flush()
+    del out_mmap
+
+    # Copy validation split from FineWeb-Edu
+    fe_valid_path = os.path.join(fineweb_edu_dir, "valid_trimmed.bin")
+    if not os.path.exists(fe_valid_path):
+        fe_valid_path = os.path.join(fineweb_edu_dir, "valid.bin")
+
+    valid_bin = os.path.join(target_dir, "valid_trimmed.bin")
+    valid_fallback = os.path.join(target_dir, "valid.bin")
+    shutil.copy(fe_valid_path, valid_bin)
+
+    # Symlinks/Fallbacks
+    if os.path.exists(train_fallback) or os.path.islink(train_fallback):
+        os.remove(train_fallback)
+    os.symlink("train_trimmed.bin", train_fallback) if hasattr(os, "symlink") else shutil.copy(train_bin, train_fallback)
+
+    if os.path.exists(valid_fallback) or os.path.islink(valid_fallback):
+        os.remove(valid_fallback)
+    os.symlink("valid_trimmed.bin", valid_fallback) if hasattr(os, "symlink") else shutil.copy(valid_bin, valid_fallback)
+
+    if not verify_dataset(target_dir, min_train_tokens=actual_train_tokens, min_valid_tokens=1_000):
+        raise RuntimeError(f"Post-generation verification failed for BookCorpusFineWebEdu in '{target_dir}'.")
+
+    print("\n✅ Custom Blend (BookCorpus + FineWeb-Edu) Preparation Complete!")
+    print(f"  - Train Dataset: '{train_bin}' ({os.path.getsize(train_bin) / (1024**2):.2f} MB, {actual_train_tokens:,} tokens)")
+    print(f"  - Valid Dataset: '{valid_bin}' ({os.path.getsize(valid_bin) / (1024**2):.2f} MB)")
+    print(f"  - Vocab Map:     '{target_vocab_map}'")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generalized Dataset Preparation Pipeline for Pretraining & Finetuning.")
     parser.add_argument(
         "-d",
         "--dataset",
-        choices=["all", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "bookcorpus", "platypus", "open-platypus"],
+        choices=["all", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "bookcorpus", "bookcorpus-fineweb-edu", "platypus", "open-platypus"],
         default="all",
         help="Dataset(s) to download and prepare (default: all)",
     )
@@ -557,6 +672,7 @@ def main():
     parser.add_argument("--fineweb-edu-dir", type=str, default="data/FineWebEdu", help="Directory for FineWeb-Edu pretraining dataset")
     parser.add_argument("--cosmopedia-dir", type=str, default="data/CosmopediaV2", help="Directory for Cosmopedia v2 pretraining dataset")
     parser.add_argument("--bookcorpus-dir", type=str, default="data/BookCorpus", help="Directory for BookCorpus pretraining dataset")
+    parser.add_argument("--blend-dir", type=str, default="data/BookCorpusFineWebEdu", help="Directory for custom BookCorpus+FineWeb-Edu blend dataset")
     parser.add_argument("--platypus-dir", type=str, default="data/OpenPlatypus", help="Directory for Open-Platypus dataset")
     parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target pretraining train token count (default: 2.6B)")
     parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target pretraining valid token count (default: 5M)")
@@ -571,6 +687,7 @@ def main():
     fineweb_edu_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb-edu") else args.fineweb_edu_dir
     cosmopedia_path = args.data_dir if (args.data_dir and dataset_choice in ["cosmopedia", "cosmopedia-v2"]) else args.cosmopedia_dir
     bookcorpus_path = args.data_dir if (args.data_dir and dataset_choice == "bookcorpus") else args.bookcorpus_dir
+    blend_path = args.data_dir if (args.data_dir and dataset_choice in ["bookcorpus-fineweb-edu", "blend"]) else args.blend_dir
     platypus_path = args.data_dir if (args.data_dir and dataset_choice in ["platypus", "open-platypus"]) else args.platypus_dir
 
     if dataset_choice in ["all", "fineweb"]:
@@ -614,6 +731,16 @@ def main():
             target_tokens=args.target_tokens,
             valid_tokens=args.valid_tokens,
             min_count=args.min_count,
+            force=args.force,
+        )
+
+    if dataset_choice in ["all", "bookcorpus-fineweb-edu", "blend"]:
+        prepare_custom_blend(
+            target_dir=blend_path,
+            bookcorpus_dir=bookcorpus_path,
+            fineweb_edu_dir=fineweb_edu_path,
+            target_train_tokens=args.target_tokens,
+            target_valid_tokens=args.valid_tokens,
             force=args.force,
         )
 

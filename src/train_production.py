@@ -210,7 +210,7 @@ def main():
     parser.add_argument("--patience", type=int, default=None, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
     parser.add_argument("--curriculum", type=str, default=None, help="Path to curriculum JSON configuration file")
-    parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "bookcorpus"], default=None, help="Dataset to train on")
+    parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "bookcorpus", "bookcorpus-fineweb-edu", "blend"], default=None, help="Dataset to train on")
     parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
@@ -284,13 +284,13 @@ def main():
     warmup_iters = max(10, int(args.total_steps * 0.05))
 
     # Determine Dataset Paths
-    if dataset_name in ["bookcorpus", "book_corpus"]:
+    if dataset_name in ["bookcorpus-fineweb-edu", "blend", "bookcorpus_fineweb_edu"]:
+        data_dir = "data/BookCorpusFineWebEdu"
+    elif dataset_name in ["bookcorpus", "book_corpus"]:
         data_dir = "data/BookCorpus"
     elif dataset_name in ["cosmopedia-v2", "cosmopedia_v2", "cosmopedia"]:
         data_dir = "data/CosmopediaV2"
-        data_dir = "data/CosmopediaV2"
     elif dataset_name in ["fineweb-edu", "fineweb_edu"]:
-        data_dir = "data/FineWebEdu"
         data_dir = "data/FineWebEdu"
     elif dataset_name == "fineweb":
         data_dir = "data/FineWeb"
