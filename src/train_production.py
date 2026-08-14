@@ -150,12 +150,20 @@ def save_checkpoint(model: GPT, optimizer: OptimizerGroup, step: int, ckpt_path:
 
     state["global_step"] = Tensor([step], dtype=dtypes.int32)
 
-    # Realize all checkpoint state tensors into GPU memory before spawning save thread
+    # Realize and synchronously copy all state tensors to CPU numpy dict on the main thread
     Tensor.realize(*state.values())
     Device[Device.DEFAULT].synchronize()
 
+    # Convert state dict tensors to CPU numpy arrays synchronously on the main thread so GPU queues are fully idle
+    cpu_state = {}
+    for k, v in state.items():
+        if isinstance(v, Tensor):
+            cpu_state[k] = Tensor(v.numpy(), device="CPU")
+        else:
+            cpu_state[k] = v
+
     def _async_save():
-        safe_save(state, ckpt_path)
+        safe_save(cpu_state, ckpt_path)
         print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
 
     save_thread = threading.Thread(target=_async_save, daemon=True)
