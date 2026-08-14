@@ -489,6 +489,7 @@ def main():
         (loss * loss_scale).backward()
         return loss.realize(*optimizer.schedule_step())
 
+    @TinyJit
     def val_step(x_m: Tensor, y_m: Tensor) -> Tensor:
         logits = model.forward(x_m)
         flat_logits = logits.reshape(-1, logits.shape[-1])
@@ -508,6 +509,13 @@ def main():
         w_loss_val = float(w_loss.cast(dtypes.float).item())
         if math.isnan(w_loss_val) or math.isinf(w_loss_val):
             raise RuntimeError(f"JIT warmup step {w + 1} produced invalid loss: {w_loss_val}")
+
+    # JIT warmup for val_step
+    w_vx, w_vy = get_batch(valid_data, 100)
+    w_vx_tensor = Tensor(w_vx[:micro_batch_size], device=params[0].device)
+    w_vy_tensor = Tensor(w_vy[:micro_batch_size], device=params[0].device)
+    _ = val_step(w_vx_tensor, w_vy_tensor)
+    Device[Device.DEFAULT].synchronize()
 
     if ckpt_path_to_load:
         _ = load_checkpoint(model, optimizer, ckpt_path_to_load)
@@ -560,6 +568,7 @@ def main():
                 x_v_tensor = Tensor(x_v[:micro_batch_size], device=params[0].device)
                 y_v_tensor = Tensor(y_v[:micro_batch_size], device=params[0].device)
                 v_loss_tensor = val_step(x_v_tensor, y_v_tensor)
+                Device[Device.DEFAULT].synchronize()
                 total_val_loss += float(v_loss_tensor.cast(dtypes.float).item())
 
             val_loss = total_val_loss / val_steps
