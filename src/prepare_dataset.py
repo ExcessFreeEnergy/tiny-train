@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-prepare_fineweb.py - Generalized Dataset Preparation Pipeline for Pretraining (FineWeb) & Finetuning (Open-Platypus).
+prepare_dataset.py - Generalized Dataset Preparation Pipeline for Pretraining (FineWeb, FineWeb-Edu) & Finetuning (Open-Platypus).
 
 Features:
-  - FineWeb (Pretraining): Downloads HuggingFaceFW/fineweb sample-10BT parquet shards and tokenizes to 1B tokens.
+  - FineWeb / FineWeb-Edu (Pretraining): Downloads HuggingFaceFW/fineweb or HuggingFaceFW/fineweb-edu parquet shards and tokenizes to 2.6B+ tokens.
   - Open-Platypus (Finetuning): Downloads garage-bAInd/Open-Platypus dataset, formats instruction-input-response
     prompts, and tokenizes into train (~95%) and validation (~5%) datasets.
-  - Vocabulary Alignment: For Open-Platypus, automatically inspects data/FineWeb/vocab_map.json if present
+  - Vocabulary Alignment: For Open-Platypus, automatically inspects pretraining vocab_map.json if present
     to align token IDs with the pre-trained embedding vocabulary.
   - Idempotency & Verification: Automatically verifies existing binary dataset artifacts (.bin and vocab_map.json).
-    If valid and complete, skips re-downloading/re-tokenizing.
   - Automated Remediation: Detects corrupted or missing dataset artifacts, cleans stale files, and remediates.
 """
 
@@ -120,10 +119,10 @@ def remediate_dataset(data_dir: str):
                 print(f"  - Warning: Failed to remove {fpath}: {e}", flush=True)
 
 
-def download_fineweb_shards(raw_dir: str, target_tokens: int = 1_005_000_000) -> list[str]:
-    """Download FineWeb sample-10BT parquet shards until target token count is reachable."""
+def download_fineweb_shards(raw_dir: str, target_tokens: int = 2_605_000_000, repo_id: str = "HuggingFaceFW/fineweb") -> list[str]:
+    """Download FineWeb or FineWeb-Edu parquet shards until target token count is reachable."""
     os.makedirs(raw_dir, exist_ok=True)
-    # Estimate ~650M tokens per parquet shard in sample/10BT
+    # Estimate ~650M tokens per parquet shard in sample/10BT or sample/100BT
     needed_shards = max(2, int(np.ceil(target_tokens / 650_000_000)))
 
     existing_parquets = glob.glob(os.path.join(raw_dir, "**/*.parquet"), recursive=True)
@@ -135,12 +134,15 @@ def download_fineweb_shards(raw_dir: str, target_tokens: int = 1_005_000_000) ->
             print(f"  - {p} ({sz_mb:.1f} MB)", flush=True)
         return valid_parquets
 
-    print(f"🔍 Fetching shard list from HuggingFaceFW/fineweb (sample-10BT) for {target_tokens:,} target tokens ({needed_shards} shards needed)...", flush=True)
+    print(f"🔍 Fetching shard list from {repo_id} for {target_tokens:,} target tokens ({needed_shards} shards needed)...", flush=True)
     api = HfApi()
-    files = api.list_repo_files(repo_id="HuggingFaceFW/fineweb", repo_type="dataset")
-    shards = sorted([f for f in files if f.startswith("sample/10BT/") and f.endswith(".parquet")])
+    files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
 
-    print(f"Found {len(shards)} parquet shards in sample/10BT/.", flush=True)
+    # Prefer sample/10BT/, sample/100BT/, sample/350BT/, or data/ parquet files
+    sample_10bt = sorted([f for f in files if f.startswith("sample/10BT/") and f.endswith(".parquet")])
+    shards = sample_10bt if sample_10bt else sorted([f for f in files if (f.startswith("sample/") or f.startswith("data/")) and f.endswith(".parquet")])
+
+    print(f"Found {len(shards)} parquet shards in {repo_id}.", flush=True)
 
     downloaded_files = list(valid_parquets)
     for shard_path in shards:
@@ -156,12 +158,22 @@ def download_fineweb_shards(raw_dir: str, target_tokens: int = 1_005_000_000) ->
         else:
             print(f"  - Downloading shard [{len(downloaded_files) + 1}/{needed_shards}]: {filename}...", flush=True)
             t0 = time.time()
-            downloaded_file = hf_hub_download(
-                repo_id="HuggingFaceFW/fineweb",
-                filename=shard_path,
-                repo_type="dataset",
-                local_dir=raw_dir,
-            )
+            downloaded_file = None
+            for attempt in range(5):
+                try:
+                    downloaded_file = hf_hub_download(
+                        repo_id=repo_id,
+                        filename=shard_path,
+                        repo_type="dataset",
+                        local_dir=raw_dir,
+                    )
+                    break
+                except Exception as e:
+                    print(f"    ⚠️ Download attempt {attempt + 1}/5 failed ({e}). Retrying in 3s...", flush=True)
+                    time.sleep(3)
+            if not downloaded_file or not os.path.exists(downloaded_file):
+                raise RuntimeError(f"Failed to download shard {shard_path} after 5 attempts.")
+
             dt = time.time() - t0
             sz_mb = os.path.getsize(downloaded_file) / (1024**2)
             print(f"    Downloaded in {dt:.2f}s ({sz_mb:.1f} MB)", flush=True)
@@ -265,37 +277,40 @@ def format_open_platypus_jsonl(parquet_paths: list[str], output_jsonl: str) -> i
     return total_records
 
 
-def prepare_fineweb(
+def prepare_pretraining_dataset(
     target_dir: str,
+    repo_id: str = "HuggingFaceFW/fineweb",
+    dataset_name: str = "FineWeb",
     target_tokens: int = 2_600_000_000,
     valid_tokens: int = 5_000_000,
     min_count: int = 50,
     force: bool = False,
 ):
-    """Download, tokenize, split, verify, and remediate FineWeb pretraining dataset."""
+    """Download, tokenize, split, verify, and remediate pretraining datasets (FineWeb, FineWeb-Edu)."""
     target_dir = os.path.abspath(target_dir)
     raw_dir = os.path.join(target_dir, "raw")
 
-    print("\n=== FineWeb Pretraining Dataset Pipeline ===")
+    print(f"\n=== {dataset_name} Pretraining Dataset Pipeline ===")
+    print(f"Repository: {repo_id}")
     print(f"Target Directory: {target_dir}")
     print(f"Target Train Tokens: {target_tokens:,}")
     print(f"Target Valid Tokens: {valid_tokens:,}\n")
 
     if not force and verify_dataset(target_dir, min_train_tokens=target_tokens, min_valid_tokens=valid_tokens):
-        print(f"[OK] Dataset 'FineWeb' in '{target_dir}' verified and ready to consume! Skipping regeneration.", flush=True)
+        print(f"[OK] Dataset '{dataset_name}' in '{target_dir}' verified and ready to consume! Skipping regeneration.", flush=True)
         return
 
     if force:
-        print("Force flag specified. Re-generating FineWeb dataset...", flush=True)
+        print(f"Force flag specified. Re-generating {dataset_name} dataset...", flush=True)
     else:
-        print("FineWeb dataset missing or corrupted. Triggering remediation...", flush=True)
+        print(f"{dataset_name} dataset missing or corrupted. Triggering remediation...", flush=True)
 
     remediate_dataset(target_dir)
 
     # Step 1: Download parquet shards
-    downloaded_shards = download_fineweb_shards(raw_dir, target_tokens=target_tokens + valid_tokens)
+    downloaded_shards = download_fineweb_shards(raw_dir, target_tokens=target_tokens + valid_tokens, repo_id=repo_id)
     if not downloaded_shards:
-        raise RuntimeError("No FineWeb parquet shards downloaded.")
+        raise RuntimeError(f"No {dataset_name} parquet shards downloaded.")
 
     # Step 2: Tokenize using retokenize.py
     full_bin = os.path.join(target_dir, "full_trimmed.bin")
@@ -322,7 +337,7 @@ def prepare_fineweb(
         vocab_map,
     ]
 
-    print("\n🚀 Tokenizing FineWeb shards using Gigatoken engine...", flush=True)
+    print(f"\n🚀 Tokenizing {dataset_name} shards using Gigatoken engine...", flush=True)
     t_tok0 = time.time()
     res = subprocess.run(cmd, text=True)
     if res.returncode != 0:
@@ -378,9 +393,9 @@ def prepare_fineweb(
 
     # Verification
     if not verify_dataset(target_dir, min_train_tokens=target_tokens, min_valid_tokens=valid_tokens):
-        raise RuntimeError(f"Post-generation verification failed for FineWeb in '{target_dir}'.")
+        raise RuntimeError(f"Post-generation verification failed for {dataset_name} in '{target_dir}'.")
 
-    print("\n✅ FineWeb Pretraining Dataset Preparation Complete!")
+    print(f"\n✅ {dataset_name} Pretraining Dataset Preparation Complete!")
     print(f"  - Train Dataset: '{train_bin}' ({os.path.getsize(train_bin) / (1024**2):.2f} MB, {target_tokens:,} tokens)")
     print(f"  - Valid Dataset: '{valid_bin}' ({os.path.getsize(valid_bin) / (1024**2):.2f} MB, {valid_tokens:,} tokens)")
     print(f"  - Vocab Map:     '{vocab_map}'")
@@ -444,11 +459,11 @@ def prepare_open_platypus(
     ]
 
     if os.path.exists(fineweb_vocab_map):
-        print(f"🔗 Aligning Open-Platypus vocabulary with FineWeb vocab map '{fineweb_vocab_map}'...", flush=True)
+        print(f"🔗 Aligning Open-Platypus vocabulary with pretraining vocab map '{fineweb_vocab_map}'...", flush=True)
         cmd.extend(["--vocab-map-in", fineweb_vocab_map])
         shutil.copy(fineweb_vocab_map, vocab_map)
     else:
-        print("⚠️ FineWeb vocab_map.json not found. Generating standalone trimmed vocabulary for Open-Platypus...", flush=True)
+        print("⚠️ Pretraining vocab_map.json not found. Generating standalone trimmed vocabulary for Open-Platypus...", flush=True)
         cmd.extend(["--trim-vocab", "--min-count", str(min_count), "--vocab-map-out", vocab_map])
 
     print("\n🚀 Tokenizing Open-Platypus formatted prompts using Gigatoken engine...", flush=True)
@@ -521,15 +536,16 @@ def main():
     parser.add_argument(
         "-d",
         "--dataset",
-        choices=["all", "fineweb", "platypus", "open-platypus"],
+        choices=["all", "fineweb", "fineweb-edu", "platypus", "open-platypus"],
         default="all",
         help="Dataset(s) to download and prepare (default: all)",
     )
     parser.add_argument("--data-dir", type=str, default=None, help="Target root directory override for dataset output")
     parser.add_argument("--fineweb-dir", type=str, default="data/FineWeb", help="Directory for FineWeb pretraining dataset")
+    parser.add_argument("--fineweb-edu-dir", type=str, default="data/FineWebEdu", help="Directory for FineWeb-Edu pretraining dataset")
     parser.add_argument("--platypus-dir", type=str, default="data/OpenPlatypus", help="Directory for Open-Platypus dataset")
-    parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target FineWeb train token count (default: 2.6B)")
-    parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target FineWeb valid token count (default: 5M)")
+    parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target pretraining train token count (default: 2.6B)")
+    parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target pretraining valid token count (default: 5M)")
     parser.add_argument("--min-count", type=int, default=50, help="Vocabulary trimming minimum count threshold")
     parser.add_argument("--force", action="store_true", default=False, help="Force dataset re-download and re-tokenization")
 
@@ -538,11 +554,25 @@ def main():
     dataset_choice = args.dataset.lower()
 
     fineweb_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb") else args.fineweb_dir
+    fineweb_edu_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb-edu") else args.fineweb_edu_dir
     platypus_path = args.data_dir if (args.data_dir and dataset_choice in ["platypus", "open-platypus"]) else args.platypus_dir
 
     if dataset_choice in ["all", "fineweb"]:
-        prepare_fineweb(
+        prepare_pretraining_dataset(
             target_dir=fineweb_path,
+            repo_id="HuggingFaceFW/fineweb",
+            dataset_name="FineWeb",
+            target_tokens=args.target_tokens,
+            valid_tokens=args.valid_tokens,
+            min_count=args.min_count,
+            force=args.force,
+        )
+
+    if dataset_choice in ["all", "fineweb-edu"]:
+        prepare_pretraining_dataset(
+            target_dir=fineweb_edu_path,
+            repo_id="HuggingFaceFW/fineweb-edu",
+            dataset_name="FineWeb-Edu",
             target_tokens=args.target_tokens,
             valid_tokens=args.valid_tokens,
             min_count=args.min_count,
@@ -554,7 +584,7 @@ def main():
             target_dir=platypus_path,
             min_count=args.min_count,
             force=args.force,
-            fineweb_dir=fineweb_path,
+            fineweb_dir=fineweb_edu_path if os.path.exists(fineweb_edu_path) else fineweb_path,
         )
 
 
