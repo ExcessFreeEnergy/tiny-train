@@ -216,6 +216,7 @@ def main():
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
     parser.add_argument("--resume-path", type=str, default=None, help="Explicit path to checkpoint file to resume from")
     parser.add_argument("--learning-rate", "--lr", type=float, default=None, help="Override peak learning rate")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="Override linear warmup step count (e.g. 50-100 for annealing)")
     parser.add_argument("--use-llrd", action="store_true", default=None, help="Enable Layer-wise Learning Rate Decay (LLRD)")
     parser.add_argument("--no-llrd", action="store_false", dest="use_llrd", help="Disable Layer-wise Learning Rate Decay (LLRD)")
     parser.add_argument("--llrd-decay", "--llrd-gamma", type=float, default=None, help="LLRD decay factor gamma (default: 0.9 or from config)")
@@ -281,7 +282,10 @@ def main():
     seq_len = int(config.get("SEQUENCE_LENGTH", 256))
     max_lr = float(args.learning_rate) if args.learning_rate is not None else float(config.get("LEARNING_RATE", 4e-4))
     min_lr = max_lr * 0.1
-    warmup_iters = max(10, int(args.total_steps * 0.05))
+    if args.warmup_steps is not None:
+        warmup_iters = args.warmup_steps
+    else:
+        warmup_iters = max(10, int(args.total_steps * 0.05))
 
     # Determine Dataset Paths
     if dataset_name in ["bookcorpus-fineweb-edu", "blend", "bookcorpus_fineweb_edu"]:
