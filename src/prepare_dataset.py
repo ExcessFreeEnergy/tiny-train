@@ -613,20 +613,40 @@ def prepare_custom_blend(
 
     actual_train_tokens = bc_count + fe_count
     print(f"Blending {bc_count:,} BookCorpus tokens + {fe_count:,} FineWeb-Edu tokens = {actual_train_tokens:,} total train tokens...", flush=True)
+    print("🔀 Performing sequence-block shuffling (2,048 tokens per chunk) to interleave domains...", flush=True)
 
     train_bin = os.path.join(target_dir, "train_trimmed.bin")
     train_fallback = os.path.join(target_dir, "train.bin")
 
+    # Group into 2048-token sequence blocks to preserve local text coherency while globally interleaving sources
+    block_size = 2048
+    bc_num_blocks = bc_count // block_size
+    fe_num_blocks = fe_count // block_size
+
+    # Build index array of (source_dataset, block_index) tuples
+    blocks = [("bc", i) for i in range(bc_num_blocks)] + [("fe", i) for i in range(fe_num_blocks)]
+    rng = np.random.default_rng(seed=42)
+    rng.shuffle(blocks)
+
+    total_shuffled_blocks = len(blocks)
+    actual_train_tokens = total_shuffled_blocks * block_size
+
     out_mmap = np.memmap(train_bin, dtype=np.uint16, mode="w+", shape=(actual_train_tokens,))
 
-    chunk_size = 50_000_000
-    for offset in range(0, bc_count, chunk_size):
-        end = min(offset + chunk_size, bc_count)
-        out_mmap[offset:end] = bc_mmap[offset:end]
+    chunk_blocks = 50_000  # Process in ~100M token batches
+    for i in range(0, total_shuffled_blocks, chunk_blocks):
+        batch = blocks[i : i + chunk_blocks]
+        out_offset = i * block_size
 
-    for offset in range(0, fe_count, chunk_size):
-        end = min(offset + chunk_size, fe_count)
-        out_mmap[bc_count + offset : bc_count + end] = fe_mmap[offset:end]
+        for b_idx, (src, src_blk_idx) in enumerate(batch):
+            src_mmap = bc_mmap if src == "bc" else fe_mmap
+            src_start = src_blk_idx * block_size
+            src_end = src_start + block_size
+
+            dst_start = out_offset + (b_idx * block_size)
+            dst_end = dst_start + block_size
+
+            out_mmap[dst_start:dst_end] = src_mmap[src_start:src_end]
 
     out_mmap.flush()
     del out_mmap
