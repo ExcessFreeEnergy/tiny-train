@@ -49,6 +49,7 @@ if "HK_FLASH_ATTENTION" not in os.environ:
 os.environ["ALLOW_TF32"] = os.environ.get("ALLOW_TF32", str(_preload_config.get("ALLOW_TF32", "1")))
 os.environ["TINYCACHE"] = os.environ.get("TINYCACHE", "1")
 os.environ["HCQ"] = os.environ.get("HCQ", "0")
+os.environ["HCQ_TIMEOUT"] = os.environ.get("HCQ_TIMEOUT", "120000")
 os.environ["TC"] = "1"
 os.environ["TENSOR_CORES"] = "1"
 os.environ["BEAM"] = os.environ.get("BEAM", str(_preload_config.get("BEAM", "2")))
@@ -126,6 +127,9 @@ def build_optimizer(model: GPT, max_lr: float, weight_decay: float, use_llrd: bo
     return optimizer, info
 
 
+import threading
+
+
 def save_checkpoint(model: GPT, optimizer: OptimizerGroup, step: int, ckpt_path: str):
     state = get_state_dict(model)
     param_to_key = {id(p): k for k, p in state.items()}
@@ -145,7 +149,17 @@ def save_checkpoint(model: GPT, optimizer: OptimizerGroup, step: int, ckpt_path:
                 state[f"opt.v.{param_key}"] = opt.v[i]
 
     state["global_step"] = Tensor([step], dtype=dtypes.int32)
-    safe_save(state, ckpt_path)
+
+    # Realize all checkpoint state tensors into GPU memory before spawning save thread
+    Tensor.realize(*state.values())
+    Device[Device.DEFAULT].synchronize()
+
+    def _async_save():
+        safe_save(state, ckpt_path)
+        print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
+
+    save_thread = threading.Thread(target=_async_save, daemon=True)
+    save_thread.start()
 
 
 def load_checkpoint(model: GPT, optimizer: OptimizerGroup, ckpt_path: str) -> int:
@@ -540,7 +554,6 @@ def main():
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")
             save_checkpoint(model, optimizer, step, ckpt_path)
-            print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
 
             if patience > 0:
                 if val_loss < best_val_loss - 1e-4:
