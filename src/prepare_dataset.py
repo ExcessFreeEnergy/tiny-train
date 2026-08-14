@@ -537,7 +537,7 @@ def main():
     parser.add_argument(
         "-d",
         "--dataset",
-        choices=["all", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "platypus", "open-platypus"],
+        choices=["all", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "bookcorpus", "platypus", "open-platypus"],
         default="all",
         help="Dataset(s) to download and prepare (default: all)",
     )
@@ -545,6 +545,7 @@ def main():
     parser.add_argument("--fineweb-dir", type=str, default="data/FineWeb", help="Directory for FineWeb pretraining dataset")
     parser.add_argument("--fineweb-edu-dir", type=str, default="data/FineWebEdu", help="Directory for FineWeb-Edu pretraining dataset")
     parser.add_argument("--cosmopedia-dir", type=str, default="data/CosmopediaV2", help="Directory for Cosmopedia v2 pretraining dataset")
+    parser.add_argument("--bookcorpus-dir", type=str, default="data/BookCorpus", help="Directory for BookCorpus pretraining dataset")
     parser.add_argument("--platypus-dir", type=str, default="data/OpenPlatypus", help="Directory for Open-Platypus dataset")
     parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target pretraining train token count (default: 2.6B)")
     parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target pretraining valid token count (default: 5M)")
@@ -558,6 +559,7 @@ def main():
     fineweb_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb") else args.fineweb_dir
     fineweb_edu_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb-edu") else args.fineweb_edu_dir
     cosmopedia_path = args.data_dir if (args.data_dir and dataset_choice in ["cosmopedia", "cosmopedia-v2"]) else args.cosmopedia_dir
+    bookcorpus_path = args.data_dir if (args.data_dir and dataset_choice == "bookcorpus") else args.bookcorpus_dir
     platypus_path = args.data_dir if (args.data_dir and dataset_choice in ["platypus", "open-platypus"]) else args.platypus_dir
 
     if dataset_choice in ["all", "fineweb"]:
@@ -587,6 +589,17 @@ def main():
             target_dir=cosmopedia_path,
             repo_id="HuggingFaceTB/cosmopedia-v2",
             dataset_name="Cosmopedia-v2",
+            target_tokens=args.target_tokens,
+            valid_tokens=args.valid_tokens,
+            min_count=args.min_count,
+            force=args.force,
+        )
+
+    if dataset_choice in ["all", "bookcorpus"]:
+        prepare_pretraining_dataset(
+            target_dir=bookcorpus_path,
+            repo_id="lucadiliello/bookcorpusopen",
+            dataset_name="BookCorpus",
             target_tokens=args.target_tokens,
             valid_tokens=args.valid_tokens,
             min_count=args.min_count,
