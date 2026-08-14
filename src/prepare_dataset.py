@@ -138,9 +138,9 @@ def download_fineweb_shards(raw_dir: str, target_tokens: int = 2_605_000_000, re
     api = HfApi()
     files = api.list_repo_files(repo_id=repo_id, repo_type="dataset")
 
-    # Prefer sample/10BT/, sample/100BT/, sample/350BT/, or data/ parquet files
+    # Prefer sample/10BT/, sample/100BT/, sample/350BT/, cosmopedia-v2/, or data/ parquet files
     sample_10bt = sorted([f for f in files if f.startswith("sample/10BT/") and f.endswith(".parquet")])
-    shards = sample_10bt if sample_10bt else sorted([f for f in files if (f.startswith("sample/") or f.startswith("data/")) and f.endswith(".parquet")])
+    shards = sample_10bt if sample_10bt else sorted([f for f in files if f.endswith(".parquet") and not f.startswith(".")])
 
     print(f"Found {len(shards)} parquet shards in {repo_id}.", flush=True)
 
@@ -536,13 +536,14 @@ def main():
     parser.add_argument(
         "-d",
         "--dataset",
-        choices=["all", "fineweb", "fineweb-edu", "platypus", "open-platypus"],
+        choices=["all", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "platypus", "open-platypus"],
         default="all",
         help="Dataset(s) to download and prepare (default: all)",
     )
     parser.add_argument("--data-dir", type=str, default=None, help="Target root directory override for dataset output")
     parser.add_argument("--fineweb-dir", type=str, default="data/FineWeb", help="Directory for FineWeb pretraining dataset")
     parser.add_argument("--fineweb-edu-dir", type=str, default="data/FineWebEdu", help="Directory for FineWeb-Edu pretraining dataset")
+    parser.add_argument("--cosmopedia-dir", type=str, default="data/CosmopediaV2", help="Directory for Cosmopedia v2 pretraining dataset")
     parser.add_argument("--platypus-dir", type=str, default="data/OpenPlatypus", help="Directory for Open-Platypus dataset")
     parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target pretraining train token count (default: 2.6B)")
     parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target pretraining valid token count (default: 5M)")
@@ -555,6 +556,7 @@ def main():
 
     fineweb_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb") else args.fineweb_dir
     fineweb_edu_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb-edu") else args.fineweb_edu_dir
+    cosmopedia_path = args.data_dir if (args.data_dir and dataset_choice in ["cosmopedia", "cosmopedia-v2"]) else args.cosmopedia_dir
     platypus_path = args.data_dir if (args.data_dir and dataset_choice in ["platypus", "open-platypus"]) else args.platypus_dir
 
     if dataset_choice in ["all", "fineweb"]:
@@ -573,6 +575,17 @@ def main():
             target_dir=fineweb_edu_path,
             repo_id="HuggingFaceFW/fineweb-edu",
             dataset_name="FineWeb-Edu",
+            target_tokens=args.target_tokens,
+            valid_tokens=args.valid_tokens,
+            min_count=args.min_count,
+            force=args.force,
+        )
+
+    if dataset_choice in ["all", "cosmopedia", "cosmopedia-v2"]:
+        prepare_pretraining_dataset(
+            target_dir=cosmopedia_path,
+            repo_id="HuggingFaceTB/cosmopedia-v2",
+            dataset_name="Cosmopedia-v2",
             target_tokens=args.target_tokens,
             valid_tokens=args.valid_tokens,
             min_count=args.min_count,
