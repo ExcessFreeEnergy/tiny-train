@@ -291,8 +291,9 @@ def prepare_pretraining_dataset(
     valid_tokens: int = 5_000_000,
     min_count: int = 50,
     force: bool = False,
+    vocab_map_in: str | None = None,
 ):
-    """Download, tokenize, split, verify, and remediate pretraining datasets (FineWeb, FineWeb-Edu)."""
+    """Download parquet shards and tokenize into binary memmaps."""
     target_dir = os.path.abspath(target_dir)
     raw_dir = os.path.join(target_dir, "raw")
 
@@ -336,12 +337,14 @@ def prepare_pretraining_dataset(
         "parquet",
         "--parquet-column",
         "text",
-        "--trim-vocab",
-        "--min-count",
-        str(min_count),
-        "--vocab-map-out",
-        vocab_map,
     ]
+
+    if vocab_map_in and os.path.exists(vocab_map_in):
+        print(f"🔗 Aligning {dataset_name} vocabulary with existing vocab map '{vocab_map_in}'...", flush=True)
+        cmd.extend(["--vocab-map-in", vocab_map_in])
+        shutil.copy(vocab_map_in, vocab_map)
+    else:
+        cmd.extend(["--trim-vocab", "--min-count", str(min_count), "--vocab-map-out", vocab_map])
 
     print(f"\n🚀 Tokenizing {dataset_name} shards using Gigatoken engine...", flush=True)
     t_tok0 = time.time()
@@ -697,6 +700,7 @@ def main():
     parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target pretraining train token count (default: 2.6B)")
     parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target pretraining valid token count (default: 5M)")
     parser.add_argument("--min-count", type=int, default=50, help="Vocabulary trimming minimum count threshold")
+    parser.add_argument("--vocab-map-in", type=str, default=None, help="Align dataset vocabulary with existing pretraining vocab map")
     parser.add_argument("--force", action="store_true", default=False, help="Force dataset re-download and re-tokenization")
 
     args = parser.parse_args()
@@ -719,6 +723,7 @@ def main():
             valid_tokens=args.valid_tokens,
             min_count=args.min_count,
             force=args.force,
+            vocab_map_in=args.vocab_map_in,
         )
 
     if dataset_choice in ["all", "fineweb-edu"]:
@@ -730,6 +735,7 @@ def main():
             valid_tokens=args.valid_tokens,
             min_count=args.min_count,
             force=args.force,
+            vocab_map_in=args.vocab_map_in,
         )
 
     if dataset_choice in ["all", "cosmopedia", "cosmopedia-v2"]:
