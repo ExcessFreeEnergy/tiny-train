@@ -229,6 +229,7 @@ def main():
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
     parser.add_argument("--resume-path", type=str, default=None, help="Explicit path to checkpoint file to resume from")
+    parser.add_argument("--init-weights-path", "--init-weights", type=str, default=None, help="Explicit path to initialize model weights from (resets step counter to 1 for new phase training)")
     parser.add_argument("--learning-rate", "--lr", type=float, default=None, help="Override peak learning rate")
     parser.add_argument("--warmup-steps", type=int, default=None, help="Override linear warmup step count (e.g. 50-100 for annealing)")
     parser.add_argument("--use-llrd", action="store_true", default=None, help="Enable Layer-wise Learning Rate Decay (LLRD)")
@@ -418,7 +419,7 @@ def main():
 
     optimizer, llrd_info = build_optimizer(model, max_lr, weight_decay, use_llrd, llrd_decay)
 
-    # Load initial state dict and optimizer momentum/variance buffers if resuming
+    # Load initial state dict and optimizer momentum/variance buffers if resuming or initializing weights
     if ckpt_path_to_load:
         print(f"🔄 Resuming training state from checkpoint: '{ckpt_path_to_load}'", flush=True)
         loaded_step = load_checkpoint(model, optimizer, ckpt_path_to_load)
@@ -429,6 +430,13 @@ def main():
             if match:
                 resumed_step = int(match.group(1))
         print(f"✅ State loaded successfully. Resume starting step {resumed_step + 1}", flush=True)
+    elif args.init_weights_path:
+        if not os.path.exists(args.init_weights_path):
+            raise FileNotFoundError(f"Initial weights checkpoint file '{args.init_weights_path}' not found.")
+        print(f"🌱 Initializing model weights from Phase 1 checkpoint: '{args.init_weights_path}'", flush=True)
+        _ = load_checkpoint(model, optimizer, args.init_weights_path)
+        resumed_step = 0
+        print("✅ Phase 1 weights loaded successfully. Starting Phase 2 training at step 1.", flush=True)
 
     start_step = resumed_step + 1
 
