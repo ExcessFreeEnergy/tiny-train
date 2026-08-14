@@ -360,7 +360,13 @@ def prepare_pretraining_dataset(
 
     needed_total = target_tokens + valid_tokens
     if total_tokens < needed_total:
-        raise ValueError(f"Generated tokens ({total_tokens:,}) less than required ({needed_total:,}). Download more shards.")
+        actual_train_tokens = max(100_000, total_tokens - valid_tokens)
+        print(
+            f"⚠️ Note: Total dataset tokens ({total_tokens:,}) is smaller than target ({needed_total:,}). "
+            f"Using maximum available tokens for training split: {actual_train_tokens:,} tokens.",
+            flush=True,
+        )
+        target_tokens = actual_train_tokens
 
     train_bin = os.path.join(target_dir, "train_trimmed.bin")
     valid_bin = os.path.join(target_dir, "valid_trimmed.bin")
