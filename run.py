@@ -37,7 +37,12 @@ from src.model import GPT
 def load_vocab_map(dataset_name: str = "tinystories", vocab_map_path: str | None = None):
     """Load vocabulary map for trimming/restoring original GPT-2 token IDs."""
     if not vocab_map_path:
-        if dataset_name.lower() == "fineweb":
+        ds = dataset_name.lower().replace("-", "")
+        if "finewebedu" in ds:
+            vocab_map_path = "data/FineWebEdu/vocab_map.json"
+        elif "bookcorpus" in ds:
+            vocab_map_path = "data/BookCorpus/vocab_map.json"
+        elif "fineweb" in ds:
             vocab_map_path = "data/FineWeb/vocab_map.json"
         else:
             vocab_map_path = "data/TinyStories/vocab_map.json"
@@ -286,7 +291,13 @@ def generate_text(
 
 def main():
     parser = argparse.ArgumentParser(description="TinyGrad Transformer Inference & Generation Engine")
-    parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb"], default="tinystories", help="Target dataset (tinystories or fineweb)")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["tinystories", "fineweb", "bookcorpus", "fineweb-edu"],
+        default="fineweb-edu",
+        help="Target dataset (tinystories, fineweb, bookcorpus, or fineweb-edu)",
+    )
     parser.add_argument("--model-size", choices=["15M", "125M"], default="125M", help="Target model scale")
     parser.add_argument("--checkpoint", type=str, default=None, help="Explicit path to .safetensors checkpoint file")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory containing model checkpoints")

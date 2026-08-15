@@ -575,11 +575,13 @@ def main():
             val_loss = total_val_loss / val_steps
             eval_tokens = val_steps * micro_batch_size * seq_len
             print(f"📊 Validation Loss at step {step} ({val_steps} steps | {eval_tokens:,} tokens): {val_loss:.4f}", flush=True)
+
             Tensor.training = True
             Device[Device.DEFAULT].synchronize()
 
             ckpt_path = os.path.join(args.checkpoint_dir, f"model_{args.model_size.lower()}_step_{step}.safetensors")
             save_checkpoint(model, optimizer, step, ckpt_path)
+            Device[Device.DEFAULT].synchronize()
 
             if patience > 0:
                 if val_loss < best_val_loss - 1e-4:
