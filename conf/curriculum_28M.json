@@ -1,0 +1,23 @@
+{
+  "model_size": "28M",
+  "target_tokens": 460000000,
+  "total_steps": 3500,
+  "peak_learning_rate": 0.0005,
+  "checkpoint_dir": "checkpoints_28m",
+  "eval_interval": 500,
+  "PAD_VOCAB_POWER_OF_2": 1,
+  "phases": [
+    {
+      "phase": 1,
+      "name": "TinyStories Chinchilla Optimal Pre-training (28M)",
+      "dataset": "tinystories",
+      "data_dir": "data/TinyStories",
+      "steps": 3500,
+      "sequence_length": 512,
+      "micro_batch_size": 16,
+      "grad_accumulation_steps": 16,
+      "learning_rate": 0.0005,
+      "warmup_steps": 200
+    }
+  ]
+}

@@ -1223,13 +1223,144 @@ def prepare_router_blend(
     if os.path.exists(valid_fallback) or os.path.islink(valid_fallback):
         os.remove(valid_fallback)
     os.symlink("valid_trimmed.bin", valid_fallback) if hasattr(os, "symlink") else shutil.copy(valid_bin, valid_fallback)
-
     if not verify_dataset(target_dir, min_train_tokens=actual_train_tokens, min_valid_tokens=1_000):
         raise RuntimeError(f"Post-generation verification failed for RouterBlend in '{target_dir}'.")
 
     print("\n✅ Router 80/20 Anchor Blend Preparation Complete!")
     print(f"  - Train Dataset: '{train_bin}' ({os.path.getsize(train_bin) / (1024**2):.2f} MB, {actual_train_tokens:,} tokens)")
     print(f"  - Valid Dataset: '{valid_bin}' ({os.path.getsize(valid_bin) / (1024**2):.2f} MB)")
+
+
+def download_tinystories_shards(raw_dir: str) -> tuple[str, str]:
+    """Download roneneldan/TinyStories dataset text files."""
+    os.makedirs(raw_dir, exist_ok=True)
+    train_txt = os.path.join(raw_dir, "TinyStories-train.txt")
+    valid_txt = os.path.join(raw_dir, "TinyStories-valid.txt")
+
+    print("🔍 Downloading roneneldan/TinyStories dataset files...", flush=True)
+    if not os.path.exists(train_txt) or os.path.getsize(train_txt) == 0:
+        train_txt = hf_hub_download(
+            repo_id="roneneldan/TinyStories",
+            filename="TinyStories-train.txt",
+            repo_type="dataset",
+            local_dir=raw_dir,
+        )
+    else:
+        print(f"  - Already exists: {train_txt} ({os.path.getsize(train_txt) / (1024**2):.1f} MB)", flush=True)
+
+    if not os.path.exists(valid_txt) or os.path.getsize(valid_txt) == 0:
+        valid_txt = hf_hub_download(
+            repo_id="roneneldan/TinyStories",
+            filename="TinyStories-valid.txt",
+            repo_type="dataset",
+            local_dir=raw_dir,
+        )
+    else:
+        print(f"  - Already exists: {valid_txt} ({os.path.getsize(valid_txt) / (1024**2):.1f} MB)", flush=True)
+
+    return train_txt, valid_txt
+
+
+def prepare_tinystories(
+    target_dir: str = "data/TinyStories",
+    min_count: int = 50,
+    force: bool = False,
+    vocab_map_in: str | None = None,
+):
+    """Download, tokenize, verify, and remediate roneneldan/TinyStories dataset."""
+    target_dir = os.path.abspath(target_dir)
+    raw_dir = os.path.join(target_dir, "raw")
+
+    print("\n=== roneneldan/TinyStories Pretraining Dataset Pipeline ===")
+    print(f"Target Directory: {target_dir}\n")
+
+    if not force and verify_dataset(target_dir, min_train_tokens=100_000, min_valid_tokens=10_000):
+        print(f"[OK] Dataset 'TinyStories' in '{target_dir}' verified and ready to consume! Skipping regeneration.", flush=True)
+        return
+
+    if force:
+        print("Force flag specified. Re-generating TinyStories dataset...", flush=True)
+    else:
+        print("TinyStories dataset missing or corrupted. Triggering remediation...", flush=True)
+
+    remediate_dataset(target_dir)
+
+    # Step 1: Download text files
+    train_txt, valid_txt = download_tinystories_shards(raw_dir)
+
+    # Step 2: Tokenize using retokenize.py
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    retokenize_script = os.path.join(project_root, "src", "retokenize.py")
+    vocab_map = os.path.join(target_dir, "vocab_map.json")
+
+    train_bin = os.path.join(target_dir, "train_trimmed.bin")
+    valid_bin = os.path.join(target_dir, "valid_trimmed.bin")
+
+    cmd_train = [
+        sys.executable,
+        retokenize_script,
+        "-i",
+        train_txt,
+        "-o",
+        train_bin,
+        "--file-type",
+        "text",
+    ]
+    if vocab_map_in and os.path.exists(vocab_map_in):
+        print(f"🔗 Aligning TinyStories train vocabulary with pretraining vocab map '{vocab_map_in}'...", flush=True)
+        cmd_train.extend(["--vocab-map-in", vocab_map_in])
+        shutil.copy(vocab_map_in, vocab_map)
+    else:
+        print("Generating vocabulary map for TinyStories...", flush=True)
+        cmd_train.extend(["--trim-vocab", "--min-count", str(min_count), "--vocab-map-out", vocab_map])
+
+    print("\n🚀 Tokenizing TinyStories train set using Gigatoken engine...", flush=True)
+    t0 = time.time()
+    res = subprocess.run(cmd_train, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Retokenization failed for TinyStories train set with exit code {res.returncode}")
+    print(f"Train tokenization complete in {time.time() - t0:.2f}s!", flush=True)
+
+    cmd_valid = [
+        sys.executable,
+        retokenize_script,
+        "-i",
+        valid_txt,
+        "-o",
+        valid_bin,
+        "--file-type",
+        "text",
+        "--vocab-map-in",
+        vocab_map,
+    ]
+    print("\n🚀 Tokenizing TinyStories valid set using Gigatoken engine...", flush=True)
+    t0 = time.time()
+    res = subprocess.run(cmd_valid, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Retokenization failed for TinyStories valid set with exit code {res.returncode}")
+    print(f"Valid tokenization complete in {time.time() - t0:.2f}s!", flush=True)
+
+    train_fallback = os.path.join(target_dir, "train.bin")
+    valid_fallback = os.path.join(target_dir, "valid.bin")
+
+    if os.path.exists(train_fallback) or os.path.islink(train_fallback):
+        os.remove(train_fallback)
+    os.symlink("train_trimmed.bin", train_fallback) if hasattr(os, "symlink") else shutil.copy(train_bin, train_fallback)
+
+    if os.path.exists(valid_fallback) or os.path.islink(valid_fallback):
+        os.remove(valid_fallback)
+    os.symlink("valid_trimmed.bin", valid_fallback) if hasattr(os, "symlink") else shutil.copy(valid_bin, valid_fallback)
+
+    if not verify_dataset(target_dir, min_train_tokens=100_000, min_valid_tokens=10_000):
+        raise RuntimeError(f"Post-generation verification failed for TinyStories in '{target_dir}'.")
+
+    train_tokens = len(np.memmap(train_bin, dtype=np.uint16, mode="r"))
+    valid_tokens = len(np.memmap(valid_bin, dtype=np.uint16, mode="r"))
+
+    print("\n✅ TinyStories Preparation Complete!")
+    print(f"  - Train Dataset: '{train_bin}' ({os.path.getsize(train_bin) / (1024**2):.2f} MB, {train_tokens:,} tokens)")
+    print(f"  - Valid Dataset: '{valid_bin}' ({os.path.getsize(valid_bin) / (1024**2):.2f} MB, {valid_tokens:,} tokens)")
+    print(f"  - Vocab Map:     '{vocab_map}'")
 
 
 def main():
@@ -1239,6 +1370,7 @@ def main():
         "--dataset",
         choices=[
             "all",
+            "tinystories",
             "fineweb",
             "fineweb-edu",
             "cosmopedia",
@@ -1256,6 +1388,7 @@ def main():
         help="Dataset(s) to download and prepare (default: all)",
     )
     parser.add_argument("--data-dir", type=str, default=None, help="Target root directory override for dataset output")
+    parser.add_argument("--tinystories-dir", type=str, default="data/TinyStories", help="Directory for TinyStories pretraining dataset")
     parser.add_argument("--fineweb-dir", type=str, default="data/FineWeb", help="Directory for FineWeb pretraining dataset")
     parser.add_argument("--fineweb-edu-dir", type=str, default="data/FineWebEdu", help="Directory for FineWeb-Edu pretraining dataset")
     parser.add_argument("--cosmopedia-dir", type=str, default="data/CosmopediaV2", help="Directory for Cosmopedia v2 pretraining dataset")
@@ -1276,6 +1409,7 @@ def main():
 
     dataset_choice = args.dataset.lower()
 
+    tinystories_path = args.data_dir if (args.data_dir and dataset_choice == "tinystories") else args.tinystories_dir
     fineweb_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb") else args.fineweb_dir
     fineweb_edu_path = args.data_dir if (args.data_dir and dataset_choice == "fineweb-edu") else args.fineweb_edu_dir
     cosmopedia_path = args.data_dir if (args.data_dir and dataset_choice in ["cosmopedia", "cosmopedia-v2"]) else args.cosmopedia_dir
@@ -1286,6 +1420,14 @@ def main():
     hermes_path = args.data_dir if (args.data_dir and dataset_choice == "hermes-fc") else args.hermes_dir
     json_pretrain_path = args.data_dir if (args.data_dir and dataset_choice == "json-pretrain") else args.json_pretrain_dir
     router_blend_path = args.data_dir if (args.data_dir and dataset_choice == "router-blend") else args.router_blend_dir
+
+    if dataset_choice in ["all", "tinystories"]:
+        prepare_tinystories(
+            target_dir=tinystories_path,
+            min_count=args.min_count,
+            force=args.force,
+            vocab_map_in=args.vocab_map_in,
+        )
 
     if dataset_choice in ["all", "fineweb"]:
         prepare_pretraining_dataset(

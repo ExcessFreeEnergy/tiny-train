@@ -208,7 +208,7 @@ def get_lr_schedule(it: int, max_iters: int, warmup_iters: int, max_lr: float, m
 
 def main():
     parser = argparse.ArgumentParser(description="Main Production Transformer Trainer")
-    parser.add_argument("--model-size", choices=["15M", "125M"], default="125M", help="Target model parameter scale")
+    parser.add_argument("--model-size", choices=["15M", "28M", "125M"], default="125M", help="Target model parameter scale")
     parser.add_argument("--total-steps", type=int, default=500, help="Total training steps")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save model checkpoints")
     parser.add_argument("--eval-interval", type=int, default=50, help="Steps between validation evaluations")
@@ -251,15 +251,19 @@ def main():
             curriculum_data = json.load(cf)
         print(f"📜 Loaded curriculum configuration: '{curriculum_path}'", flush=True)
 
-    if curriculum_data and "phases" in curriculum_data and len(curriculum_data["phases"]) > 0:
-        # Default active phase settings to Phase 1 initially or calculated total steps
-        p1 = curriculum_data["phases"][0]
-        config["MICRO_BATCH_SIZE"] = p1.get("micro_batch_size", config.get("MICRO_BATCH_SIZE", 16))
-        config["GRAD_ACCUMULATION_STEPS"] = p1.get("grad_accumulation_steps", config.get("GRAD_ACCUMULATION_STEPS", 64))
-        config["SEQUENCE_LENGTH"] = p1.get("sequence_length", config.get("SEQUENCE_LENGTH", 512))
-        total_curr_steps = sum(p.get("steps", 0) for p in curriculum_data["phases"])
-        if total_curr_steps > 0 and args.total_steps == 500: # 500 is default parser value
-            args.total_steps = total_curr_steps
+    if curriculum_data:
+        for k, v in curriculum_data.items():
+            if k != "phases":
+                config[k.upper()] = v
+        if "phases" in curriculum_data and len(curriculum_data["phases"]) > 0:
+            # Default active phase settings to Phase 1 initially or calculated total steps
+            p1 = curriculum_data["phases"][0]
+            config["MICRO_BATCH_SIZE"] = p1.get("micro_batch_size", config.get("MICRO_BATCH_SIZE", 16))
+            config["GRAD_ACCUMULATION_STEPS"] = p1.get("grad_accumulation_steps", config.get("GRAD_ACCUMULATION_STEPS", 64))
+            config["SEQUENCE_LENGTH"] = p1.get("sequence_length", config.get("SEQUENCE_LENGTH", 512))
+            total_curr_steps = sum(p.get("steps", 0) for p in curriculum_data["phases"])
+            if total_curr_steps > 0 and args.total_steps == 500: # 500 is default parser value
+                args.total_steps = total_curr_steps
 
     if args.use_llrd is not None:
         use_llrd = args.use_llrd
@@ -346,6 +350,12 @@ def main():
         n_layers = 12
         n_heads = 12
         d_ff = 3072
+    elif args.model_size == "28M":
+        vocab_size = dataset_vocab_size
+        d_model = 512
+        n_layers = 6
+        n_heads = 8
+        d_ff = 2048
     else:
         vocab_size = dataset_vocab_size
         d_model = 288
@@ -357,7 +367,7 @@ def main():
     use_rope = bool(config.get("USE_ROPE", 1))
     use_flash_attn = bool(int(os.environ.get("HK_FLASH_ATTENTION", config.get("HK_FLASH_ATTENTION", 1))))
     pad_vocab_mult = int(config.get("PAD_VOCAB_MULTIPLE", 1))
-    pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 0))
+    pad_vocab_p2 = bool(config.get("PAD_VOCAB_POWER_OF_2", 1))
     use_jit = bool(config.get("JIT", 1))
 
     if os.path.exists(train_bin):

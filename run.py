@@ -361,7 +361,7 @@ def main():
         default="fineweb-edu",
         help="Target dataset (e.g. fineweb-edu, router, synth-apigen, hermes-fc, json-pretrain)",
     )
-    parser.add_argument("--model-size", choices=["15M", "125M"], default="125M", help="Target model scale")
+    parser.add_argument("--model-size", choices=["15M", "28M", "125M"], default="125M", help="Target model scale")
     parser.add_argument("--checkpoint", type=str, default=None, help="Explicit path to .safetensors checkpoint file")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory containing model checkpoints")
     parser.add_argument("--prompt", type=str, default="Once upon a time", help="Initial generation prompt")
@@ -444,6 +444,11 @@ def main():
         n_layers = 12
         n_heads = 12
         d_ff = 3072
+    elif args.model_size == "28M":
+        d_model = 512
+        n_layers = 6
+        n_heads = 8
+        d_ff = 2048
     else:
         d_model = 288
         n_layers = 6
