@@ -20,6 +20,7 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 | 🎓 **tinygrad 3-Phase Curriculum 125M (FineWeb)** | **125M** | **`@TinyJit` + BEAM=2** | **22.10s** | **218.63 ms** | **1,170.9** | **446.43 TFLOPS** | **135.28%** | **7.5918** |
 | ✨ **tinygrad Best Practice Refactor (BS=8, GA=16)** | **125M (151.6M)** | **Clean `@TinyJit` + BEAM=2** | **32.41s** | **3,460.07 ms** | **37.0** | **34.45 TFLOPS** | **10.44%** | **8.0000** |
 | 🧪 **tinygrad Microbatch Sweep (BS=16, GA=8)** | **125M (151.6M)** | **Clean `@TinyJit` + BEAM=2** | **2,010.41s** | **4,024.67 ms** | **31.8** | **29.62 TFLOPS** | **8.97%** | **8.0000** |
+| 🚀 **tinygrad TinyStories 28M (Chinchilla)** | **28M (33.6M)** | **`@TinyJit` + BEAM=2** | **16.52s** | **115.54 ms** | **2,215.6** | **228.65 TFLOPS** | **69.29%** | **2.0127** |
 | **PyTorch Default** | 125M | `torch.compile` | 3.7s | 159.33 ms | 401.7 | 83.83 TFLOPS | 25.40% | 5.9404 |
 | **PyTorch Autotune 125M** | 125M | `max-autotune` | 21.8s | 271.91 ms | 235.4 | 98.25 TFLOPS | 29.77% | 6.0209 |
 | **PyTorch 350M Scale** | 350M | `reduce-overhead` | 25.2s | 237.70 ms | 33.7 | 103.03 TFLOPS | 31.22% | 7.3492 |
@@ -115,3 +116,6 @@ This document tracks cumulative performance benchmarks, architectural refactorin
 
 15. **KV-Cached Single-Token Step Generation & Symbolic `@TinyJit` Inference (`run.py`)**:
     Optimized autoregressive text generation in `run.py` and `src/model.py` using persistent KV caching (`cache_kv`) and symbolic `Variable("start_pos")` inside `@TinyJit`. Reduced single-token step input shape from `(1, 256)` down to `(1, 1)`. Generation throughput increased from **31.8 tokens/sec to 185.0+ tokens/sec** (**5.8x speedup**), per-token latency dropped from **24.30 ms down to 4.10 ms**, and TTFT dropped to **108.42 ms** (**6.5x faster**). Set `strict=False` in `load_state_dict` to prevent non-parameter buffer `KeyError`. Preserved 100% parallel performance for model training by activating KV caching only during inference.
+
+16. **28M Parameter Scale & Pure Power-of-2 Vocabulary Padding ($16,384 = 2^{14}$)**:
+    Added the `28M` parameter scale preset (`d_model=512, n_layers=6, n_heads=8, d_ff=2048`) and integrated `roneneldan/TinyStories`. Padded active dataset vocabulary (13,969 tokens) to a pure power of 2 (**16,384 tokens**), ensuring all model dimensions ($D=512, d_{ff}=2048, V=16384, B=8192$) strictly align with CUDA warp and block boundaries. Resolved BEAM search kernel compilation timeouts, achieving **1,142,317 tokens/sec throughput** (over 1.14M tok/sec), **69.29% MFU**, and a final validation loss of **2.0127** over 3,500 steps (463M tokens) of Chinchilla optimal pre-training.
