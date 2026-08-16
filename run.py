@@ -14,6 +14,7 @@ Usage Examples:
 """
 
 import argparse
+import codecs
 import json
 import os
 import re
@@ -34,11 +35,34 @@ from src.chat_engine import apply_repetition_penalty
 from src.model import GPT
 
 
+class StreamingDecoder:
+    """Incremental UTF-8 decoder buffer for streaming token output without splitting multi-byte sequences."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+
+    def decode_token(self, token_id: int) -> str:
+        token_bytes = self.tokenizer.decode_single_token_bytes(token_id)
+        return self.decoder.decode(token_bytes, final=False)
+
+    def flush(self) -> str:
+        return self.decoder.decode(b"", final=True)
+
+
 def load_vocab_map(dataset_name: str = "tinystories", vocab_map_path: str | None = None):
     """Load vocabulary map for trimming/restoring original GPT-2 token IDs."""
     if not vocab_map_path:
-        ds = dataset_name.lower().replace("-", "")
-        if "finewebedu" in ds:
+        ds = dataset_name.lower().replace("-", "").replace("_", "")
+        if "synth" in ds:
+            vocab_map_path = "data/SynthAPIGen/vocab_map.json"
+        elif "hermes" in ds:
+            vocab_map_path = "data/HermesFunctionCalling/vocab_map.json"
+        elif "jsonpretrain" in ds or "json" in ds:
+            vocab_map_path = "data/JSONPretrain/vocab_map.json"
+        elif "router" in ds:
+            vocab_map_path = "data/RouterBlend/vocab_map.json"
+        elif "finewebedu" in ds:
             vocab_map_path = "data/FineWebEdu/vocab_map.json"
         elif "bookcorpus" in ds:
             vocab_map_path = "data/BookCorpus/vocab_map.json"
@@ -47,15 +71,19 @@ def load_vocab_map(dataset_name: str = "tinystories", vocab_map_path: str | None
         else:
             vocab_map_path = "data/TinyStories/vocab_map.json"
 
-    if not os.path.exists(vocab_map_path):
-        vocab_map_path = os.path.join(os.path.dirname(__file__), vocab_map_path)
+    search_paths = [
+        vocab_map_path,
+        os.path.join(os.path.dirname(__file__), vocab_map_path),
+        os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), vocab_map_path),
+    ]
 
-    if os.path.exists(vocab_map_path):
-        with open(vocab_map_path) as f:
-            vmap = json.load(f)
-        orig_to_new = {int(k): int(v) for k, v in vmap.get("orig_to_new", {}).items()}
-        new_to_orig = vmap.get("new_to_orig", [])
-        return orig_to_new, new_to_orig
+    for p in search_paths:
+        if os.path.exists(p):
+            with open(p) as f:
+                vmap = json.load(f)
+            orig_to_new = {int(k): int(v) for k, v in vmap.get("orig_to_new", {}).items()}
+            new_to_orig = vmap.get("new_to_orig", [])
+            return orig_to_new, new_to_orig
     print(f"⚠️ Vocab map file '{vocab_map_path}' not found. Using identity token mapping.", flush=True)
     return None, None
 
@@ -93,30 +121,43 @@ def find_latest_checkpoint(checkpoint_dir: str, model_size: str) -> str | None:
     return best_ckpt
 
 
-def sample(logits: Tensor, temp: float = 0.8, top_k: int = 40) -> Tensor:
-    """Sample next token index on device using temperature scaling and top-k / multinomial sampling."""
+def sample(logits: Tensor, temp: float = 0.8, top_k: int = 40, top_p: float = 0.9) -> Tensor:
+    """Sample next token index on device using temperature scaling, top-k, and nucleus top-p filtering."""
     assert logits.ndim == 1, "sample expects 1D logits tensor"
     if temp < 1e-6:
         return logits.argmax().cast(dtypes.int32)
 
     logits = logits.to(Device.DEFAULT)
     logits = (logits != logits).where(-float("inf"), logits)
-    t = (logits / temp).softmax()
+    scaled_logits = logits / max(temp, 1e-5)
 
     if top_k > 0 and top_k < logits.numel():
-        counter = Tensor.arange(t.numel(), device=t.device).contiguous()
-        counter2 = Tensor.arange(t.numel() - 1, -1, -1, device=t.device).contiguous()
-        output = Tensor.zeros(top_k, device=t.device).contiguous()
-        output_indices = Tensor.zeros(top_k, device=t.device, dtype=dtypes.int32).contiguous()
+        counter = Tensor.arange(scaled_logits.numel(), device=scaled_logits.device).contiguous()
+        counter2 = Tensor.arange(scaled_logits.numel() - 1, -1, -1, device=scaled_logits.device).contiguous()
+        top_k_logits = Tensor.zeros(top_k, device=scaled_logits.device).contiguous()
+        top_k_indices = Tensor.zeros(top_k, device=scaled_logits.device, dtype=dtypes.int32).contiguous()
+        l_copy = scaled_logits
         for i in range(top_k):
-            t_argmax = (t.numel() - ((t == (t_max := t.max())) * counter2).max() - 1).cast(dtypes.default_int)
-            output = output + t_max.unsqueeze(0).pad(((i, top_k - i - 1),))
-            output_indices = output_indices + t_argmax.unsqueeze(0).pad(((i, top_k - i - 1),))
-            t = (counter == t_argmax).where(0, t)
-        output_idx = output.multinomial()
-        output_token = output_indices[output_idx]
+            t_argmax = (l_copy.numel() - ((l_copy == (l_max := l_copy.max())) * counter2).max() - 1).cast(dtypes.default_int)
+            top_k_logits = top_k_logits + l_max.unsqueeze(0).pad(((i, top_k - i - 1),))
+            top_k_indices = top_k_indices + t_argmax.unsqueeze(0).pad(((i, top_k - i - 1),))
+            l_copy = (counter == t_argmax).where(-float("inf"), l_copy)
+
+        probs = top_k_logits.softmax()
+
+        if top_p < 1.0:
+            tri = Tensor.ones(top_k, top_k, device=probs.device).tril()
+            cum_probs = probs @ tri
+            prev_cum = cum_probs - probs
+            mask = (prev_cum < top_p).cast(probs.dtype)
+            probs = probs * mask
+            probs = probs / (probs.sum() + 1e-10)
+
+        output_idx = probs.multinomial()
+        output_token = top_k_indices[output_idx]
     else:
-        output_token = t.multinomial().cast(dtypes.int32)
+        probs = scaled_logits.softmax()
+        output_token = probs.multinomial().cast(dtypes.int32)
 
     return output_token
 
@@ -136,14 +177,15 @@ class GPTEngine:
         start_pos: Variable | int,
         temperature: float,
         top_k: int,
-        repetition_penalty: float = 1.15,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
         context_mask: Tensor | None = None,
     ) -> Tensor:
         logits = self.model.forward(tokens, start_pos=start_pos)
         last_logits = logits[0, -1, : self.raw_vocab_size]
         if repetition_penalty != 1.0 and context_mask is not None:
             last_logits = apply_repetition_penalty(last_logits, penalty=repetition_penalty, context_mask=context_mask)
-        return sample(last_logits, temp=temperature, top_k=top_k)
+        return sample(last_logits, temp=temperature, top_k=top_k, top_p=top_p)
 
     def __call__(
         self,
@@ -151,15 +193,26 @@ class GPTEngine:
         start_pos: int,
         temperature: float = 0.8,
         top_k: int = 40,
-        repetition_penalty: float = 1.15,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
         context_mask: Tensor | None = None,
     ) -> Tensor:
         if context_mask is None:
             context_mask = Tensor.zeros(self.raw_vocab_size, dtype=dtypes.bool, device=Device.DEFAULT).clone().realize()
         if tokens.shape == (1, 1) and self.step_jit is not None and start_pos != 0:
             v_start_pos = Variable("start_pos", 1, self.max_context - 1).bind(start_pos)
-            return self.step_jit(tokens, v_start_pos, temperature, top_k, repetition_penalty, context_mask)
-        return self.step(tokens, start_pos, temperature, top_k, repetition_penalty, context_mask)
+            return self.step_jit(tokens, v_start_pos, temperature, top_k, top_p, repetition_penalty, context_mask)
+        return self.step(tokens, start_pos, temperature, top_k, top_p, repetition_penalty, context_mask)
+
+
+def make_context_mask(current_ids: list[int], raw_vocab_size: int, window_size: int = 64) -> Tensor:
+    """Create context mask over recent tokens (sliding window) to prevent unbounded repetition penalization."""
+    recent = current_ids[-window_size:] if window_size > 0 else current_ids
+    mask_np = np.zeros(raw_vocab_size, dtype=bool)
+    valid_ids = [tid for tid in recent if 0 <= tid < raw_vocab_size]
+    if valid_ids:
+        mask_np[valid_ids] = True
+    return Tensor(mask_np, device=Device.DEFAULT).clone().realize()
 
 
 def generate_text(
@@ -171,7 +224,8 @@ def generate_text(
     max_new_tokens: int = 100,
     temperature: float = 0.8,
     top_k: int = 40,
-    repetition_penalty: float = 1.15,
+    top_p: float = 0.9,
+    repetition_penalty: float = 1.0,
     profile: bool = False,
     timing: bool = False,
 ) -> str:
@@ -183,18 +237,21 @@ def generate_text(
         orig_prompt_ids = [50256]  # Fallback to EOS
 
     if orig_to_new:
-        trimmed_prompt_ids = [orig_to_new.get(tid, 0) for tid in orig_prompt_ids]
+        trimmed_prompt_ids = []
+        for tid in orig_prompt_ids:
+            if tid in orig_to_new:
+                trimmed_prompt_ids.append(orig_to_new[tid])
+            else:
+                print(f"⚠️ Prompt token ID {tid} ('{tokenizer.decode([tid])}') not in trimmed vocab map. Defaulting to 0.", flush=True)
+                trimmed_prompt_ids.append(0)
     else:
         trimmed_prompt_ids = list(orig_prompt_ids)
 
     current_ids = list(trimmed_prompt_ids)
     prompt_len = len(trimmed_prompt_ids)
 
-    mask_np = np.zeros(engine.raw_vocab_size, dtype=bool)
-    valid_ids = [tid for tid in trimmed_prompt_ids if 0 <= tid < engine.raw_vocab_size]
-    if valid_ids:
-        mask_np[valid_ids] = True
-    context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
+    context_mask = make_context_mask(current_ids, engine.raw_vocab_size, window_size=64)
+    stream_decoder = StreamingDecoder(tokenizer)
 
     print(f'\n📝 Prompt: "{prompt}"', flush=True)
     print("-------------------------------------------------------", flush=True)
@@ -212,20 +269,21 @@ def generate_text(
             start_pos=0,
             temperature=temperature,
             top_k=top_k,
+            top_p=top_p,
             repetition_penalty=repetition_penalty,
             context_mask=context_mask,
         ).realize()
         next_trimmed_id = tok_tensor.item()
         current_ids.append(next_trimmed_id)
-        if 0 <= next_trimmed_id < engine.raw_vocab_size:
-            mask_np[next_trimmed_id] = True
-            context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
+        context_mask = make_context_mask(current_ids, engine.raw_vocab_size, window_size=64)
         ttft_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Stream first generated token
+        # Stream first generated token using incremental UTF-8 decoder
         orig_id = new_to_orig[next_trimmed_id] if new_to_orig and next_trimmed_id < len(new_to_orig) else next_trimmed_id
-        sys.stdout.write(tokenizer.decode([orig_id]))
-        sys.stdout.flush()
+        chunk = stream_decoder.decode_token(orig_id)
+        if chunk:
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
 
         # 2. Autoregressive single-token generation phase
         start_pos = prompt_len
@@ -247,22 +305,28 @@ def generate_text(
                     start_pos=start_pos,
                     temperature=temperature,
                     top_k=top_k,
+                    top_p=top_p,
                     repetition_penalty=repetition_penalty,
                     context_mask=context_mask,
                 ).realize()
                 next_trimmed_id = tok_tensor.item()
 
             current_ids.append(next_trimmed_id)
-            if 0 <= next_trimmed_id < engine.raw_vocab_size:
-                mask_np[next_trimmed_id] = True
-                context_mask = Tensor(mask_np, device=Device.DEFAULT).clone().realize()
+            context_mask = make_context_mask(current_ids, engine.raw_vocab_size, window_size=64)
 
             start_pos += 1
             step_ms = (time.perf_counter() - t_step_0) * 1000.0
             token_times_ms.append(step_ms)
 
             orig_id = new_to_orig[next_trimmed_id] if new_to_orig and next_trimmed_id < len(new_to_orig) else next_trimmed_id
-            sys.stdout.write(tokenizer.decode([orig_id]))
+            chunk = stream_decoder.decode_token(orig_id)
+            if chunk:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+
+        tail = stream_decoder.flush()
+        if tail:
+            sys.stdout.write(tail)
             sys.stdout.flush()
 
     sys.stdout.write("\n-------------------------------------------------------\n")
@@ -294,9 +358,8 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["tinystories", "fineweb", "bookcorpus", "fineweb-edu"],
         default="fineweb-edu",
-        help="Target dataset (tinystories, fineweb, bookcorpus, or fineweb-edu)",
+        help="Target dataset (e.g. fineweb-edu, router, synth-apigen, hermes-fc, json-pretrain)",
     )
     parser.add_argument("--model-size", choices=["15M", "125M"], default="125M", help="Target model scale")
     parser.add_argument("--checkpoint", type=str, default=None, help="Explicit path to .safetensors checkpoint file")
@@ -305,12 +368,22 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100, help="Number of new tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature (0.0 for greedy)")
     parser.add_argument("--top-k", type=int, default=40, help="Top-k filtering threshold")
-    parser.add_argument("--repetition-penalty", type=float, default=1.15, help="Repetition penalty scalar (default 1.15)")
+    parser.add_argument("--top-p", type=float, default=0.9, help="Top-p (nucleus) filtering threshold (default 0.9)")
+    parser.add_argument("--repetition-penalty", type=float, default=1.0, help="Repetition penalty scalar (default 1.0)")
     parser.add_argument("--no-jit", action="store_true", default=False, help="Disable @TinyJit compilation")
     parser.add_argument("--timing", action="store_true", default=False, help="Print per-token timing and memory bandwidth")
     parser.add_argument("--profile", action="store_true", default=False, help="Enable detailed inference profiling telemetry")
     parser.add_argument("--interactive", action="store_true", default=False, help="Run interactive prompt loop")
     args = parser.parse_args()
+
+    if args.temperature < 0:
+        raise ValueError("--temperature must be >= 0")
+    if args.top_k < 0:
+        raise ValueError("--top-k must be >= 0")
+    if not (0.0 < args.top_p <= 1.0):
+        raise ValueError("--top-p must be in range (0.0, 1.0]")
+    if args.repetition_penalty < 0.0:
+        raise ValueError("--repetition-penalty must be >= 0.0")
 
     # Locate checkpoint
     ckpt_path = args.checkpoint
@@ -319,6 +392,18 @@ def main():
 
     if not ckpt_path or not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"No valid checkpoint found for model scale '{args.model_size}' in directory '{args.checkpoint_dir}'.")
+
+    # Auto-infer dataset from checkpoint path if --dataset was not explicitly passed
+    if "--dataset" not in sys.argv:
+        ckpt_lower = ckpt_path.lower()
+        if "finewebedu" in ckpt_lower or "fineweb-edu" in ckpt_lower:
+            args.dataset = "fineweb-edu"
+        elif "bookcorpus" in ckpt_lower:
+            args.dataset = "bookcorpus"
+        elif "fineweb" in ckpt_lower:
+            args.dataset = "fineweb"
+        elif "tinystories" in ckpt_lower:
+            args.dataset = "tinystories"
 
     print("\n=======================================================", flush=True)
     print(f"🚀 TINYGRAD INFERENCE ENGINE ({args.model_size} | Dataset: {args.dataset})", flush=True)
@@ -338,10 +423,20 @@ def main():
     wte_shape = state["wte"].shape
     ckpt_padded_vocab_size = wte_shape[0]
 
-    # Auto-detect dataset if checkpoint vocab size > 30000 (FineWeb)
-    if ckpt_padded_vocab_size > 30000 and args.dataset.lower() == "tinystories":
-        args.dataset = "fineweb"
-        orig_to_new, new_to_orig = load_vocab_map(dataset_name=args.dataset)
+    # Auto-detect dataset if checkpoint vocab size mismatch or missing map
+    if ckpt_padded_vocab_size > 30000 and (not new_to_orig or abs(len(new_to_orig) - ckpt_padded_vocab_size) > 256):
+        for candidate_ds in ["fineweb-edu", "fineweb", "bookcorpus", "tinystories"]:
+            c_orig_to_new, c_new_to_orig = load_vocab_map(dataset_name=candidate_ds)
+            if c_new_to_orig and abs(len(c_new_to_orig) - ckpt_padded_vocab_size) <= 256:
+                print(f"💡 Auto-inferred dataset '{candidate_ds}' from checkpoint vocab size ({ckpt_padded_vocab_size})", flush=True)
+                args.dataset = candidate_ds
+                orig_to_new, new_to_orig = c_orig_to_new, c_new_to_orig
+                break
+
+    if ckpt_padded_vocab_size > 30000 and not new_to_orig:
+        raise RuntimeError(
+            f"Checkpoint '{ckpt_path}' has padded vocab size {ckpt_padded_vocab_size}, but no matching vocab_map.json could be loaded for dataset '{args.dataset}'."
+        )
 
     # Model Preset Architecture Parameters
     if args.model_size == "125M":
@@ -410,6 +505,7 @@ def main():
             max_new_tokens=args.max_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
             repetition_penalty=args.repetition_penalty,
             profile=args.profile,
             timing=args.timing,
@@ -418,3 +514,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

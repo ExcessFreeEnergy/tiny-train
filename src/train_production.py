@@ -127,7 +127,6 @@ def build_optimizer(model: GPT, max_lr: float, weight_decay: float, use_llrd: bo
     return optimizer, info
 
 
-import threading
 
 
 def save_checkpoint(model: GPT, optimizer: OptimizerGroup, step: int, ckpt_path: str):
@@ -150,24 +149,11 @@ def save_checkpoint(model: GPT, optimizer: OptimizerGroup, step: int, ckpt_path:
 
     state["global_step"] = Tensor([step], dtype=dtypes.int32)
 
-    # Realize and synchronously copy all state tensors to CPU numpy dict on the main thread
     Tensor.realize(*state.values())
     Device[Device.DEFAULT].synchronize()
 
-    # Convert state dict tensors to CPU numpy arrays synchronously on the main thread so GPU queues are fully idle
-    cpu_state = {}
-    for k, v in state.items():
-        if isinstance(v, Tensor):
-            cpu_state[k] = Tensor(v.numpy(), device="CPU")
-        else:
-            cpu_state[k] = v
-
-    def _async_save():
-        safe_save(cpu_state, ckpt_path)
-        print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
-
-    save_thread = threading.Thread(target=_async_save, daemon=True)
-    save_thread.start()
+    safe_save(state, ckpt_path)
+    print(f"💾 Checkpoint saved to '{ckpt_path}' (including optimizer state)", flush=True)
 
 
 def load_checkpoint(model: GPT, optimizer: OptimizerGroup, ckpt_path: str) -> int:
@@ -232,7 +218,8 @@ def main():
     parser.add_argument("--patience", type=int, default=None, help="Patience for early stopping (consecutive evaluations without improvement, 0 to disable)")
     parser.add_argument("--config", type=str, default=None, help="Path to configuration file")
     parser.add_argument("--curriculum", type=str, default=None, help="Path to curriculum JSON configuration file")
-    parser.add_argument("--dataset", type=str, choices=["tinystories", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "bookcorpus", "bookcorpus-fineweb-edu", "blend"], default=None, help="Dataset to train on")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset to train on (e.g. fineweb-edu, json-pretrain, synth-apigen, hermes-fc, router-blend)")
+    parser.add_argument("--data-dir", type=str, default=None, help="Explicit data directory path override containing train_trimmed.bin and vocab_map.json")
     parser.add_argument("--disable-debug", "--no-debug", action="store_true", default=False, help="Disable debug print logging")
     parser.add_argument("--debug-level", "--debug", type=int, default=None, help="Set debug logging level")
     parser.add_argument("--resume", action="store_true", default=False, help="Resume training from latest checkpoint in checkpoint-dir")
@@ -311,7 +298,17 @@ def main():
         warmup_iters = max(10, int(args.total_steps * 0.05))
 
     # Determine Dataset Paths
-    if dataset_name in ["bookcorpus-fineweb-edu", "blend", "bookcorpus_fineweb_edu"]:
+    if args.data_dir:
+        data_dir = args.data_dir
+    elif dataset_name in ["json-pretrain", "json_pretrain"]:
+        data_dir = "data/JSONPretrain"
+    elif dataset_name in ["synth-apigen", "synth_apigen"]:
+        data_dir = "data/SynthAPIGen"
+    elif dataset_name in ["hermes-fc", "hermes_fc", "hermes"]:
+        data_dir = "data/HermesFunctionCalling"
+    elif dataset_name in ["router-blend", "router_blend", "router"]:
+        data_dir = "data/RouterBlend"
+    elif dataset_name in ["bookcorpus-fineweb-edu", "blend", "bookcorpus_fineweb_edu"]:
         data_dir = "data/BookCorpusFineWebEdu"
     elif dataset_name in ["bookcorpus", "book_corpus"]:
         data_dir = "data/BookCorpus"
@@ -442,9 +439,16 @@ def main():
         if not os.path.exists(args.init_weights_path):
             raise FileNotFoundError(f"Initial weights checkpoint file '{args.init_weights_path}' not found.")
         print(f"🌱 Initializing model weights from Phase 1 checkpoint: '{args.init_weights_path}'", flush=True)
-        _ = load_checkpoint(model, optimizer, args.init_weights_path)
+        init_state = safe_load(args.init_weights_path)
+        load_state_dict(model, init_state, strict=False)
+        for opt in optimizer.optimizers:
+            for i in range(len(opt.m)):
+                opt.m[i].assign(Tensor.zeros_like(opt.m[i]))
+                opt.v[i].assign(Tensor.zeros_like(opt.v[i]))
+            opt.b1_t.assign(Tensor.ones_like(opt.b1_t))
+            opt.b2_t.assign(Tensor.ones_like(opt.b2_t))
         resumed_step = 0
-        print("✅ Phase 1 weights loaded successfully. Starting Phase 2 training at step 1.", flush=True)
+        print("✅ Phase 1 weights loaded successfully. Reset optimizer AdamW state to zero for Phase 2 training at step 1.", flush=True)
 
     start_step = resumed_step + 1
 
@@ -517,14 +521,6 @@ def main():
     _ = val_step(w_vx_tensor, w_vy_tensor)
     Device[Device.DEFAULT].synchronize()
 
-    init_ckpt = ckpt_path_to_load or args.init_weights_path
-    if init_ckpt:
-        _ = load_checkpoint(model, optimizer, init_ckpt)
-        Tensor.realize(*params)
-        for opt in optimizer.optimizers:
-            Tensor.realize(*opt.m, *opt.v, opt.b1_t, opt.b2_t)
-        Device[Device.DEFAULT].synchronize()
-
     # CRITICAL: Harness telemetry log string
     sys.stderr.write(f"[train_production.py] JIT Warmup complete in {time.time() - w_start:.2f}s\n")
 
@@ -536,6 +532,7 @@ def main():
 
     # Production Training Loop
     for step in range(start_step, args.total_steps + 1):
+        Tensor.training = True
         cur_lr = get_lr_schedule(step, args.total_steps, warmup_iters, max_lr, min_lr)
         lr_tensor = Tensor([cur_lr], device=params[0].device)
 

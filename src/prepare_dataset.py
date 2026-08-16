@@ -683,12 +683,575 @@ def prepare_custom_blend(
     print(f"  - Vocab Map:     '{target_vocab_map}'")
 
 
+def download_synth_apigen_shards(raw_dir: str) -> list[str]:
+    """Download argilla/Synth-APIGen-v0.1 dataset parquet file."""
+    os.makedirs(raw_dir, exist_ok=True)
+    existing = glob.glob(os.path.join(raw_dir, "**/*.parquet"), recursive=True)
+    valid = [p for p in existing if os.path.exists(p) and os.path.getsize(p) > 0]
+    if valid:
+        print(f"Found {len(valid)} existing parquet shard(s) for Synth-APIGen in {raw_dir}:", flush=True)
+        for p in valid:
+            print(f"  - {p} ({os.path.getsize(p) / (1024**2):.1f} MB)", flush=True)
+        return valid
+
+    print("🔍 Downloading argilla/Synth-APIGen-v0.1 dataset...", flush=True)
+    fpath = hf_hub_download(
+        repo_id="argilla/Synth-APIGen-v0.1",
+        filename="data/train-00000-of-00001.parquet",
+        repo_type="dataset",
+        local_dir=raw_dir,
+    )
+    return [fpath]
+
+
+def format_synth_apigen_jsonl(parquet_paths: list[str], output_jsonl: str) -> int:
+    """Format argilla/Synth-APIGen-v0.1 parquet rows into tool-calling instruction JSONL records, preserving native format."""
+    import pyarrow.parquet as pq
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_jsonl)), exist_ok=True)
+    print(f"✍️ Formatting Synth-APIGen records to '{output_jsonl}'...", flush=True)
+
+    total_records = 0
+    with open(output_jsonl, "w", encoding="utf-8") as f_out:
+        for ppath in parquet_paths:
+            table = pq.read_table(ppath)
+            cols = table.column_names
+            num_rows = table.num_rows
+
+            queries = table["query"].to_pylist() if "query" in cols else [""] * num_rows
+            answers = table["answers"].to_pylist() if "answers" in cols else [""] * num_rows
+            tools_col = table["tools"].to_pylist() if "tools" in cols else [""] * num_rows
+
+            for query_text, ans_text, tools_text in zip(queries, answers, tools_col):
+                query_str = (query_text or "").strip()
+                ans_str = (ans_text or "").strip()
+                tools_str = (tools_text or "").strip()
+
+                # Filter out unanswerable queries
+                if not ans_str or ans_str.startswith("The query cannot be answered") or ans_str.startswith("The given question lacks"):
+                    continue
+
+                if tools_str and tools_str != "[]":
+                    prompt_text = (
+                        "Below is a user query along with available tool definitions in JSON format. "
+                        "Select the appropriate tool(s) and provide the tool call(s) as a strict JSON array.\n\n"
+                        f"<tools>\n{tools_str}\n</tools>\n\n"
+                        f"### Query:\n{query_str}\n\n"
+                        f"### Response:\n{ans_str}"
+                    )
+                else:
+                    prompt_text = (
+                        "Below is a user query. Provide the appropriate tool call or structured JSON response.\n\n"
+                        f"### Query:\n{query_str}\n\n"
+                        f"### Response:\n{ans_str}"
+                    )
+
+                record = json.dumps({"text": prompt_text})
+                f_out.write(record + "\n")
+                total_records += 1
+
+    print(f"Formatted {total_records:,} Synth-APIGen instruction entries into JSONL.", flush=True)
+    return total_records
+
+
+def prepare_synth_apigen(
+    target_dir: str = "data/SynthAPIGen",
+    min_count: int = 50,
+    force: bool = False,
+    vocab_map_in: str | None = None,
+):
+    """Download, format, tokenize, split, verify, and remediate Synth-APIGen tool-calling dataset."""
+    target_dir = os.path.abspath(target_dir)
+    raw_dir = os.path.join(target_dir, "raw")
+
+    print("\n=== Argilla Synth-APIGen Tool-Calling Dataset Pipeline ===")
+    print(f"Target Directory: {target_dir}\n")
+
+    if not force and verify_dataset(target_dir, min_train_tokens=50_000, min_valid_tokens=5_000):
+        print(f"[OK] Dataset 'SynthAPIGen' in '{target_dir}' verified and ready to consume! Skipping regeneration.", flush=True)
+        return
+
+    if force:
+        print("Force flag specified. Re-generating Synth-APIGen dataset...", flush=True)
+    else:
+        print("Synth-APIGen dataset missing or corrupted. Triggering remediation...", flush=True)
+
+    remediate_dataset(target_dir)
+
+    # Step 1: Download parquet shards
+    shards = download_synth_apigen_shards(raw_dir)
+
+    # Step 2: Format records into JSONL
+    formatted_jsonl = os.path.join(raw_dir, "formatted.jsonl")
+    total_records = format_synth_apigen_jsonl(shards, formatted_jsonl)
+    if total_records == 0:
+        raise RuntimeError("Formatted zero records from Synth-APIGen dataset.")
+
+    # Step 3: Tokenize using retokenize.py
+    full_bin = os.path.join(target_dir, "full_trimmed.bin")
+    vocab_map = os.path.join(target_dir, "vocab_map.json")
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    retokenize_script = os.path.join(project_root, "src", "retokenize.py")
+
+    cmd = [
+        sys.executable,
+        retokenize_script,
+        "-i",
+        formatted_jsonl,
+        "-o",
+        full_bin,
+        "--file-type",
+        "jsonl",
+        "--json-field",
+        "text",
+    ]
+
+    if vocab_map_in and os.path.exists(vocab_map_in):
+        print(f"🔗 Aligning Synth-APIGen vocabulary with pretraining vocab map '{vocab_map_in}'...", flush=True)
+        cmd.extend(["--vocab-map-in", vocab_map_in])
+        shutil.copy(vocab_map_in, vocab_map)
+    else:
+        print("Generating vocabulary map for Synth-APIGen...", flush=True)
+        cmd.extend(["--trim-vocab", "--min-count", str(min_count), "--vocab-map-out", vocab_map])
+
+    print("\n🚀 Tokenizing Synth-APIGen formatted prompts using Gigatoken engine...", flush=True)
+    t0 = time.time()
+    res = subprocess.run(cmd, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Retokenization failed for Synth-APIGen with exit code {res.returncode}")
+    print(f"Tokenization complete in {time.time() - t0:.2f}s!", flush=True)
+
+    full_data = np.memmap(full_bin, dtype=np.uint16, mode="r")
+    total_tokens = len(full_data)
+
+    # Step 4: Split into 95% train / 5% valid split
+    train_tokens = int(total_tokens * 0.95)
+    valid_tokens = total_tokens - train_tokens
+
+    train_bin = os.path.join(target_dir, "train_trimmed.bin")
+    valid_bin = os.path.join(target_dir, "valid_trimmed.bin")
+    train_fallback = os.path.join(target_dir, "train.bin")
+    valid_fallback = os.path.join(target_dir, "valid.bin")
+
+    train_mmap = np.memmap(train_bin, dtype=np.uint16, mode="w+", shape=(train_tokens,))
+    train_mmap[:] = full_data[:train_tokens]
+    train_mmap.flush()
+    del train_mmap
+
+    valid_mmap = np.memmap(valid_bin, dtype=np.uint16, mode="w+", shape=(valid_tokens,))
+    valid_mmap[:] = full_data[train_tokens : train_tokens + valid_tokens]
+    valid_mmap.flush()
+    del valid_mmap
+
+    if os.path.exists(train_fallback) or os.path.islink(train_fallback):
+        os.remove(train_fallback)
+    os.symlink("train_trimmed.bin", train_fallback) if hasattr(os, "symlink") else shutil.copy(train_bin, train_fallback)
+
+    if os.path.exists(valid_fallback) or os.path.islink(valid_fallback):
+        os.remove(valid_fallback)
+    os.symlink("valid_trimmed.bin", valid_fallback) if hasattr(os, "symlink") else shutil.copy(valid_bin, valid_fallback)
+
+    if os.path.exists(full_bin):
+        os.remove(full_bin)
+    if os.path.exists(formatted_jsonl):
+        os.remove(formatted_jsonl)
+
+    if not verify_dataset(target_dir, min_train_tokens=train_tokens, min_valid_tokens=valid_tokens):
+        raise RuntimeError(f"Post-generation verification failed for Synth-APIGen in '{target_dir}'.")
+
+    print("\n✅ Synth-APIGen Preparation Complete!")
+    print(f"  - Train Dataset: '{train_bin}' ({os.path.getsize(train_bin) / (1024**2):.2f} MB, {train_tokens:,} tokens)")
+    print(f"  - Valid Dataset: '{valid_bin}' ({os.path.getsize(valid_bin) / (1024**2):.2f} MB, {valid_tokens:,} tokens)")
+
+
+def download_hermes_function_calling_shards(raw_dir: str) -> list[str]:
+    """Download NousResearch/hermes-function-calling-v1 JSON files."""
+    os.makedirs(raw_dir, exist_ok=True)
+    files = [
+        "func-calling.json",
+        "glaive-function-calling-5k.json",
+        "json-mode-agentic.json",
+        "json-mode-singleturn.json",
+        "func-calling-singleturn.json",
+    ]
+
+    downloaded = []
+    print("🔍 Downloading NousResearch/hermes-function-calling-v1 files...", flush=True)
+    for fname in files:
+        target_path = os.path.join(raw_dir, fname)
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+            print(f"  - Already exists: {target_path} ({os.path.getsize(target_path) / (1024**2):.1f} MB)", flush=True)
+            downloaded.append(target_path)
+        else:
+            try:
+                path = hf_hub_download(
+                    repo_id="NousResearch/hermes-function-calling-v1",
+                    filename=fname,
+                    repo_type="dataset",
+                    local_dir=raw_dir,
+                )
+                downloaded.append(path)
+            except Exception as e:
+                print(f"  ⚠️ Warning: Failed to download {fname}: {e}", flush=True)
+
+    return downloaded
+
+
+def format_hermes_jsonl(json_paths: list[str], output_jsonl: str) -> int:
+    """Format NousResearch/hermes-function-calling-v1 conversation objects into unified JSON array records, converting all <tool_call> XML tags to raw JSON arrays."""
+    import re
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_jsonl)), exist_ok=True)
+    print(f"✍️ Formatting Hermes Function Calling records into unified JSON arrays to '{output_jsonl}'...", flush=True)
+
+    total_records = 0
+    with open(output_jsonl, "w", encoding="utf-8") as f_out:
+        for jpath in json_paths:
+            with open(jpath, encoding="utf-8") as f_in:
+                items = json.load(f_in)
+                if not isinstance(items, list):
+                    items = [items]
+
+                for item in items:
+                    conversations = item.get("conversations", [])
+                    if not conversations:
+                        continue
+
+                    tools_str = ""
+                    for turn in conversations:
+                        r = turn.get("from") or turn.get("role") or ""
+                        val = (turn.get("value") or turn.get("content") or "").strip()
+                        if r == "system":
+                            m = re.search(r"<tools>\s*(.*?)\s*</tools>", val, re.DOTALL)
+                            if m:
+                                tools_str = m.group(1).strip()
+
+                    curr_query = ""
+                    for turn in conversations:
+                        r = turn.get("from") or turn.get("role") or ""
+                        val = (turn.get("value") or turn.get("content") or "").strip()
+
+                        if r in ["human", "user"]:
+                            curr_query = val
+                        elif r in ["gpt", "assistant"] and curr_query:
+                            # Extract tool call XML blocks
+                            tool_matches = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", val, re.DOTALL)
+                            calls = []
+                            if tool_matches:
+                                for tm in tool_matches:
+                                    try:
+                                        calls.append(json.loads(tm))
+                                    except Exception:
+                                        pass
+                            else:
+                                try:
+                                    parsed = json.loads(val)
+                                    if isinstance(parsed, list):
+                                        calls = parsed
+                                    elif isinstance(parsed, dict):
+                                        calls = [parsed]
+                                except Exception:
+                                    pass
+
+                            if calls:
+                                json_arr_str = json.dumps(calls, separators=(",", ":"))
+                                if tools_str:
+                                    prompt_text = (
+                                        "Below is a user query along with available tool definitions in JSON format. "
+                                        "Select the appropriate tool(s) and provide the tool call(s) as a strict JSON array.\n\n"
+                                        f"<tools>\n{tools_str}\n</tools>\n\n"
+                                        f"### Query:\n{curr_query}\n\n"
+                                        f"### Response:\n{json_arr_str}"
+                                    )
+                                else:
+                                    prompt_text = (
+                                        "Below is a user query. Provide the appropriate tool call or structured JSON response.\n\n"
+                                        f"### Query:\n{curr_query}\n\n"
+                                        f"### Response:\n{json_arr_str}"
+                                    )
+
+                                record = json.dumps({"text": prompt_text})
+                                f_out.write(record + "\n")
+                                total_records += 1
+
+    print(f"Formatted {total_records:,} unified JSON array instruction entries from Hermes into JSONL.", flush=True)
+    return total_records
+
+
+def prepare_hermes_fc(
+    target_dir: str = "data/HermesFunctionCalling",
+    min_count: int = 50,
+    force: bool = False,
+    vocab_map_in: str | None = None,
+):
+    """Download, format, tokenize, split, verify, and remediate Hermes Function Calling dataset."""
+    target_dir = os.path.abspath(target_dir)
+    raw_dir = os.path.join(target_dir, "raw")
+
+    print("\n=== NousResearch Hermes Function Calling Dataset Pipeline ===")
+    print(f"Target Directory: {target_dir}\n")
+
+    if not force and verify_dataset(target_dir, min_train_tokens=50_000, min_valid_tokens=5_000):
+        print(f"[OK] Dataset 'HermesFunctionCalling' in '{target_dir}' verified and ready to consume! Skipping regeneration.", flush=True)
+        return
+
+    if force:
+        print("Force flag specified. Re-generating Hermes FC dataset...", flush=True)
+    else:
+        print("Hermes FC dataset missing or corrupted. Triggering remediation...", flush=True)
+
+    remediate_dataset(target_dir)
+
+    # Step 1: Download JSON shards
+    json_paths = download_hermes_function_calling_shards(raw_dir)
+
+    # Step 2: Format records into JSONL
+    formatted_jsonl = os.path.join(raw_dir, "formatted.jsonl")
+    total_records = format_hermes_jsonl(json_paths, formatted_jsonl)
+    if total_records == 0:
+        raise RuntimeError("Formatted zero records from Hermes Function Calling dataset.")
+
+    # Step 3: Tokenize using retokenize.py
+    full_bin = os.path.join(target_dir, "full_trimmed.bin")
+    vocab_map = os.path.join(target_dir, "vocab_map.json")
+
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    retokenize_script = os.path.join(project_root, "src", "retokenize.py")
+
+    cmd = [
+        sys.executable,
+        retokenize_script,
+        "-i",
+        formatted_jsonl,
+        "-o",
+        full_bin,
+        "--file-type",
+        "jsonl",
+        "--json-field",
+        "text",
+    ]
+
+    if vocab_map_in and os.path.exists(vocab_map_in):
+        print(f"🔗 Aligning Hermes FC vocabulary with pretraining vocab map '{vocab_map_in}'...", flush=True)
+        cmd.extend(["--vocab-map-in", vocab_map_in])
+        shutil.copy(vocab_map_in, vocab_map)
+    else:
+        print("Generating vocabulary map for Hermes FC...", flush=True)
+        cmd.extend(["--trim-vocab", "--min-count", str(min_count), "--vocab-map-out", vocab_map])
+
+    print("\n🚀 Tokenizing Hermes FC formatted prompts using Gigatoken engine...", flush=True)
+    t0 = time.time()
+    res = subprocess.run(cmd, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"Retokenization failed for Hermes FC with exit code {res.returncode}")
+    print(f"Tokenization complete in {time.time() - t0:.2f}s!", flush=True)
+
+    full_data = np.memmap(full_bin, dtype=np.uint16, mode="r")
+    total_tokens = len(full_data)
+
+    # Step 4: Split into 95% train / 5% valid split
+    train_tokens = int(total_tokens * 0.95)
+    valid_tokens = total_tokens - train_tokens
+
+    train_bin = os.path.join(target_dir, "train_trimmed.bin")
+    valid_bin = os.path.join(target_dir, "valid_trimmed.bin")
+    train_fallback = os.path.join(target_dir, "train.bin")
+    valid_fallback = os.path.join(target_dir, "valid.bin")
+
+    train_mmap = np.memmap(train_bin, dtype=np.uint16, mode="w+", shape=(train_tokens,))
+    train_mmap[:] = full_data[:train_tokens]
+    train_mmap.flush()
+    del train_mmap
+
+    valid_mmap = np.memmap(valid_bin, dtype=np.uint16, mode="w+", shape=(valid_tokens,))
+    valid_mmap[:] = full_data[train_tokens : train_tokens + valid_tokens]
+    valid_mmap.flush()
+    del valid_mmap
+
+    if os.path.exists(train_fallback) or os.path.islink(train_fallback):
+        os.remove(train_fallback)
+    os.symlink("train_trimmed.bin", train_fallback) if hasattr(os, "symlink") else shutil.copy(train_bin, train_fallback)
+
+    if os.path.exists(valid_fallback) or os.path.islink(valid_fallback):
+        os.remove(valid_fallback)
+    os.symlink("valid_trimmed.bin", valid_fallback) if hasattr(os, "symlink") else shutil.copy(valid_bin, valid_fallback)
+
+    if os.path.exists(full_bin):
+        os.remove(full_bin)
+    if os.path.exists(formatted_jsonl):
+        os.remove(formatted_jsonl)
+
+    if not verify_dataset(target_dir, min_train_tokens=train_tokens, min_valid_tokens=valid_tokens):
+        raise RuntimeError(f"Post-generation verification failed for Hermes FC in '{target_dir}'.")
+
+    print("\n✅ Hermes Function Calling Preparation Complete!")
+    print(f"  - Train Dataset: '{train_bin}' ({os.path.getsize(train_bin) / (1024**2):.2f} MB, {train_tokens:,} tokens)")
+    print(f"  - Valid Dataset: '{valid_bin}' ({os.path.getsize(valid_bin) / (1024**2):.2f} MB, {valid_tokens:,} tokens)")
+
+
+def prepare_router_blend(
+    target_dir: str = "data/RouterBlend",
+    synth_dir: str = "data/SynthAPIGen",
+    hermes_dir: str = "data/HermesFunctionCalling",
+    json_pretrain_dir: str = "data/JSONPretrain",
+    target_train_tokens: int = 85_000_000,
+    target_valid_tokens: int = 5_000_000,
+    force: bool = False,
+):
+    """Combine 40% Synth-APIGen + 40% Hermes FC + 20% JSONPretrain (80/20 Anchor Blend) with block-level sequence shuffling."""
+    target_dir = os.path.abspath(target_dir)
+    print("\n=== Agentic Router 80/20 Anchor Curriculum Blend Pipeline ===")
+    print(f"Target Directory: {target_dir}")
+    print(f"Target Train Tokens: {target_train_tokens:,}\n")
+
+    if not force and verify_dataset(target_dir, min_train_tokens=50_000, min_valid_tokens=1_000):
+        print(f"[OK] Dataset 'RouterBlend' in '{target_dir}' verified and ready to consume! Skipping regeneration.", flush=True)
+        return
+
+    # Ensure source datasets exist
+    if not verify_dataset(synth_dir, min_train_tokens=10_000, min_valid_tokens=1_000):
+        prepare_synth_apigen(target_dir=synth_dir, force=force)
+
+    synth_vocab = os.path.join(synth_dir, "vocab_map.json")
+    if not verify_dataset(hermes_dir, min_train_tokens=10_000, min_valid_tokens=1_000):
+        prepare_hermes_fc(target_dir=hermes_dir, force=force, vocab_map_in=synth_vocab if os.path.exists(synth_vocab) else None)
+
+    if not verify_dataset(json_pretrain_dir, min_train_tokens=10_000, min_valid_tokens=1_000):
+        prepare_pretraining_dataset(
+            target_dir=json_pretrain_dir,
+            repo_id="HuggingFaceFW/fineweb-edu",
+            dataset_name="FineWeb-Edu-JSON",
+            target_tokens=2_600_000_000,
+            valid_tokens=target_valid_tokens,
+            force=force,
+            vocab_map_in=synth_vocab if os.path.exists(synth_vocab) else None,
+        )
+
+    os.makedirs(target_dir, exist_ok=True)
+    remediate_dataset(target_dir)
+
+    synth_bin = os.path.join(synth_dir, "train_trimmed.bin")
+    if not os.path.exists(synth_bin):
+        synth_bin = os.path.join(synth_dir, "train.bin")
+
+    hermes_bin = os.path.join(hermes_dir, "train_trimmed.bin")
+    if not os.path.exists(hermes_bin):
+        hermes_bin = os.path.join(hermes_dir, "train.bin")
+
+    json_bin = os.path.join(json_pretrain_dir, "train_trimmed.bin")
+    if not os.path.exists(json_bin):
+        json_bin = os.path.join(json_pretrain_dir, "train.bin")
+
+    # Copy vocabulary map
+    target_vocab = os.path.join(target_dir, "vocab_map.json")
+    if os.path.exists(synth_vocab):
+        shutil.copy(synth_vocab, target_vocab)
+    elif os.path.exists(os.path.join(json_pretrain_dir, "vocab_map.json")):
+        shutil.copy(os.path.join(json_pretrain_dir, "vocab_map.json"), target_vocab)
+
+    synth_mmap = np.memmap(synth_bin, dtype=np.uint16, mode="r")
+    hermes_mmap = np.memmap(hermes_bin, dtype=np.uint16, mode="r")
+    json_mmap = np.memmap(json_bin, dtype=np.uint16, mode="r")
+
+    # Target 80/20 Anchor Blend: 40% SynthAPIGen, 40% HermesFC, 20% JSONPretrain
+    req_synth = int(target_train_tokens * 0.40)
+    req_hermes = int(target_train_tokens * 0.40)
+    req_json = target_train_tokens - req_synth - req_hermes
+
+    block_size = 2048
+    synth_b_count = req_synth // block_size
+    hermes_b_count = req_hermes // block_size
+    json_b_count = req_json // block_size
+
+    synth_max_b = len(synth_mmap) // block_size
+    hermes_max_b = len(hermes_mmap) // block_size
+    json_max_b = len(json_mmap) // block_size
+
+    # Loop indices if target requirement exceeds source tokens
+    blocks = [("synth", i % synth_max_b) for i in range(synth_b_count)] + [("hermes", i % hermes_max_b) for i in range(hermes_b_count)] + [("json", i % json_max_b) for i in range(json_b_count)]
+    rng = np.random.default_rng(seed=42)
+    rng.shuffle(blocks)
+
+    total_blocks = len(blocks)
+    actual_train_tokens = total_blocks * block_size
+
+    print(f"Blending 40% Synth-APIGen ({synth_b_count * block_size:,} tokens) + 40% Hermes FC ({hermes_b_count * block_size:,} tokens) + 20% JSONPretrain ({json_b_count * block_size:,} tokens) = {actual_train_tokens:,} total tokens...", flush=True)
+
+    train_bin = os.path.join(target_dir, "train_trimmed.bin")
+    train_fallback = os.path.join(target_dir, "train.bin")
+
+    out_mmap = np.memmap(train_bin, dtype=np.uint16, mode="w+", shape=(actual_train_tokens,))
+
+    chunk_blocks = 50_000
+    for i in range(0, total_blocks, chunk_blocks):
+        batch = blocks[i : i + chunk_blocks]
+        out_offset = i * block_size
+
+        for b_idx, (src, src_blk_idx) in enumerate(batch):
+            if src == "synth":
+                src_mmap = synth_mmap
+            elif src == "hermes":
+                src_mmap = hermes_mmap
+            else:
+                src_mmap = json_mmap
+
+            src_start = src_blk_idx * block_size
+            src_end = src_start + block_size
+            dst_start = out_offset + (b_idx * block_size)
+            dst_end = dst_start + block_size
+
+            out_mmap[dst_start:dst_end] = src_mmap[src_start:src_end]
+
+    out_mmap.flush()
+    del out_mmap
+
+    # Copy valid bin from Synth-APIGen
+    synth_valid = os.path.join(synth_dir, "valid_trimmed.bin")
+    if not os.path.exists(synth_valid):
+        synth_valid = os.path.join(synth_dir, "valid.bin")
+
+    valid_bin = os.path.join(target_dir, "valid_trimmed.bin")
+    valid_fallback = os.path.join(target_dir, "valid.bin")
+    if os.path.exists(synth_valid):
+        shutil.copy(synth_valid, valid_bin)
+
+    if os.path.exists(train_fallback) or os.path.islink(train_fallback):
+        os.remove(train_fallback)
+    os.symlink("train_trimmed.bin", train_fallback) if hasattr(os, "symlink") else shutil.copy(train_bin, train_fallback)
+
+    if os.path.exists(valid_fallback) or os.path.islink(valid_fallback):
+        os.remove(valid_fallback)
+    os.symlink("valid_trimmed.bin", valid_fallback) if hasattr(os, "symlink") else shutil.copy(valid_bin, valid_fallback)
+
+    if not verify_dataset(target_dir, min_train_tokens=actual_train_tokens, min_valid_tokens=1_000):
+        raise RuntimeError(f"Post-generation verification failed for RouterBlend in '{target_dir}'.")
+
+    print("\n✅ Router 80/20 Anchor Blend Preparation Complete!")
+    print(f"  - Train Dataset: '{train_bin}' ({os.path.getsize(train_bin) / (1024**2):.2f} MB, {actual_train_tokens:,} tokens)")
+    print(f"  - Valid Dataset: '{valid_bin}' ({os.path.getsize(valid_bin) / (1024**2):.2f} MB)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generalized Dataset Preparation Pipeline for Pretraining & Finetuning.")
     parser.add_argument(
         "-d",
         "--dataset",
-        choices=["all", "fineweb", "fineweb-edu", "cosmopedia", "cosmopedia-v2", "bookcorpus", "bookcorpus-fineweb-edu", "platypus", "open-platypus"],
+        choices=[
+            "all",
+            "fineweb",
+            "fineweb-edu",
+            "cosmopedia",
+            "cosmopedia-v2",
+            "bookcorpus",
+            "bookcorpus-fineweb-edu",
+            "platypus",
+            "open-platypus",
+            "synth-apigen",
+            "hermes-fc",
+            "json-pretrain",
+            "router-blend",
+        ],
         default="all",
         help="Dataset(s) to download and prepare (default: all)",
     )
@@ -699,6 +1262,10 @@ def main():
     parser.add_argument("--bookcorpus-dir", type=str, default="data/BookCorpus", help="Directory for BookCorpus pretraining dataset")
     parser.add_argument("--blend-dir", type=str, default="data/BookCorpusFineWebEdu", help="Directory for custom BookCorpus+FineWeb-Edu blend dataset")
     parser.add_argument("--platypus-dir", type=str, default="data/OpenPlatypus", help="Directory for Open-Platypus dataset")
+    parser.add_argument("--synth-dir", type=str, default="data/SynthAPIGen", help="Directory for Argilla Synth-APIGen tool-calling dataset")
+    parser.add_argument("--hermes-dir", type=str, default="data/HermesFunctionCalling", help="Directory for NousResearch Hermes Function Calling dataset")
+    parser.add_argument("--json-pretrain-dir", type=str, default="data/JSONPretrain", help="Directory for Structured JSON pretraining dataset")
+    parser.add_argument("--router-blend-dir", type=str, default="data/RouterBlend", help="Directory for Agentic Router curriculum blend dataset")
     parser.add_argument("--target-tokens", type=int, default=2_600_000_000, help="Target pretraining train token count (default: 2.6B)")
     parser.add_argument("--valid-tokens", type=int, default=5_000_000, help="Target pretraining valid token count (default: 5M)")
     parser.add_argument("--min-count", type=int, default=50, help="Vocabulary trimming minimum count threshold")
@@ -715,6 +1282,10 @@ def main():
     bookcorpus_path = args.data_dir if (args.data_dir and dataset_choice == "bookcorpus") else args.bookcorpus_dir
     blend_path = args.data_dir if (args.data_dir and dataset_choice in ["bookcorpus-fineweb-edu", "blend"]) else args.blend_dir
     platypus_path = args.data_dir if (args.data_dir and dataset_choice in ["platypus", "open-platypus"]) else args.platypus_dir
+    synth_path = args.data_dir if (args.data_dir and dataset_choice == "synth-apigen") else args.synth_dir
+    hermes_path = args.data_dir if (args.data_dir and dataset_choice == "hermes-fc") else args.hermes_dir
+    json_pretrain_path = args.data_dir if (args.data_dir and dataset_choice == "json-pretrain") else args.json_pretrain_dir
+    router_blend_path = args.data_dir if (args.data_dir and dataset_choice == "router-blend") else args.router_blend_dir
 
     if dataset_choice in ["all", "fineweb"]:
         prepare_pretraining_dataset(
@@ -778,6 +1349,45 @@ def main():
             min_count=args.min_count,
             force=args.force,
             fineweb_dir=fineweb_edu_path if os.path.exists(fineweb_edu_path) else fineweb_path,
+        )
+
+    if dataset_choice in ["all", "synth-apigen"]:
+        prepare_synth_apigen(
+            target_dir=synth_path,
+            min_count=args.min_count,
+            force=args.force,
+            vocab_map_in=args.vocab_map_in,
+        )
+
+    if dataset_choice in ["all", "hermes-fc"]:
+        prepare_hermes_fc(
+            target_dir=hermes_path,
+            min_count=args.min_count,
+            force=args.force,
+            vocab_map_in=args.vocab_map_in or (os.path.join(synth_path, "vocab_map.json") if os.path.exists(os.path.join(synth_path, "vocab_map.json")) else None),
+        )
+
+    if dataset_choice in ["all", "json-pretrain"]:
+        prepare_pretraining_dataset(
+            target_dir=json_pretrain_path,
+            repo_id="HuggingFaceFW/fineweb-edu",
+            dataset_name="FineWeb-Edu-JSON",
+            target_tokens=args.target_tokens,
+            valid_tokens=args.valid_tokens,
+            min_count=args.min_count,
+            force=args.force,
+            vocab_map_in=args.vocab_map_in,
+        )
+
+    if dataset_choice in ["all", "router-blend"]:
+        prepare_router_blend(
+            target_dir=router_blend_path,
+            synth_dir=synth_path,
+            hermes_dir=hermes_path,
+            json_pretrain_dir=json_pretrain_path,
+            target_train_tokens=args.target_tokens,
+            target_valid_tokens=args.valid_tokens,
+            force=args.force,
         )
 
 

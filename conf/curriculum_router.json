@@ -1,0 +1,31 @@
+{
+  "model_size": "125M",
+  "checkpoint_dir": "checkpoints_router",
+  "eval_interval": 500,
+  "total_steps": 650,
+  "phases": [
+    {
+      "phase": 1,
+      "name": "Pre-training Padding (Structural Priors)",
+      "dataset": "json-pretrain",
+      "data_dir": "data/JSONPretrain",
+      "steps": 1500,
+      "sequence_length": 512,
+      "micro_batch_size": 16,
+      "grad_accumulation_steps": 16,
+      "learning_rate": 0.00025
+    },
+    {
+      "phase": 2,
+      "name": "Instruction Alignment & Tool-Calling Fine-Tuning (80/20 Anchor Blend)",
+      "dataset": "router-blend",
+      "data_dir": "data/RouterBlend",
+      "steps": 650,
+      "sequence_length": 512,
+      "micro_batch_size": 16,
+      "grad_accumulation_steps": 32,
+      "learning_rate": 0.00002,
+      "warmup_steps": 50
+    }
+  ]
+}

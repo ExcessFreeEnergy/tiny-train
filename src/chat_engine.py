@@ -22,20 +22,30 @@ from src.model import GPT
 def load_vocab_map(dataset_name: str = "tinystories", vocab_map_path: str | None = None):
     """Load vocabulary map for trimming/restoring original GPT-2 token IDs."""
     if not vocab_map_path:
-        if dataset_name.lower() == "fineweb":
+        ds = dataset_name.lower().replace("-", "").replace("_", "")
+        if "finewebedu" in ds:
+            vocab_map_path = "data/FineWebEdu/vocab_map.json"
+        elif "bookcorpus" in ds:
+            vocab_map_path = "data/BookCorpus/vocab_map.json"
+        elif "fineweb" in ds:
             vocab_map_path = "data/FineWeb/vocab_map.json"
         else:
             vocab_map_path = "data/TinyStories/vocab_map.json"
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    full_path = os.path.join(base_dir, vocab_map_path) if not os.path.isabs(vocab_map_path) else vocab_map_path
+    search_paths = [
+        vocab_map_path,
+        os.path.join(base_dir, vocab_map_path),
+        os.path.join(os.path.dirname(__file__), vocab_map_path),
+    ]
 
-    if os.path.exists(full_path):
-        with open(full_path) as f:
-            vmap = json.load(f)
-        orig_to_new = {int(k): int(v) for k, v in vmap.get("orig_to_new", {}).items()}
-        new_to_orig = vmap.get("new_to_orig", [])
-        return orig_to_new, new_to_orig
+    for p in search_paths:
+        if os.path.exists(p):
+            with open(p) as f:
+                vmap = json.load(f)
+            orig_to_new = {int(k): int(v) for k, v in vmap.get("orig_to_new", {}).items()}
+            new_to_orig = vmap.get("new_to_orig", [])
+            return orig_to_new, new_to_orig
     return None, None
 
 
@@ -96,33 +106,37 @@ def sample_logits(logits: Tensor, temp: float = 0.8, top_k: int = 40, top_p: flo
 
     logits = logits.to(Device.DEFAULT)
     logits = (logits != logits).where(-float("inf"), logits)
-    t = (logits / temp).softmax()
+    scaled_logits = logits / max(temp, 1e-5)
 
     # Top-K filtering
     if 0 < top_k < logits.numel():
-        counter = Tensor.arange(t.numel(), device=t.device).contiguous()
-        counter2 = Tensor.arange(t.numel() - 1, -1, -1, device=t.device).contiguous()
-        output = Tensor.zeros(top_k, device=t.device).contiguous()
-        output_indices = Tensor.zeros(top_k, device=t.device, dtype=dtypes.int32).contiguous()
+        counter = Tensor.arange(scaled_logits.numel(), device=scaled_logits.device).contiguous()
+        counter2 = Tensor.arange(scaled_logits.numel() - 1, -1, -1, device=scaled_logits.device).contiguous()
+        top_k_logits = Tensor.zeros(top_k, device=scaled_logits.device).contiguous()
+        top_k_indices = Tensor.zeros(top_k, device=scaled_logits.device, dtype=dtypes.int32).contiguous()
+        l_copy = scaled_logits
         for i in range(top_k):
-            t_argmax = (t.numel() - ((t == (t_max := t.max())) * counter2).max() - 1).cast(dtypes.default_int)
-            output = output + t_max.unsqueeze(0).pad(((i, top_k - i - 1),))
-            output_indices = output_indices + t_argmax.unsqueeze(0).pad(((i, top_k - i - 1),))
-            t = (counter == t_argmax).where(0, t)
+            t_argmax = (l_copy.numel() - ((l_copy == (l_max := l_copy.max())) * counter2).max() - 1).cast(dtypes.default_int)
+            top_k_logits = top_k_logits + l_max.unsqueeze(0).pad(((i, top_k - i - 1),))
+            top_k_indices = top_k_indices + t_argmax.unsqueeze(0).pad(((i, top_k - i - 1),))
+            l_copy = (counter == t_argmax).where(-float("inf"), l_copy)
+
+        probs = top_k_logits.softmax()
 
         # Apply top_p (nucleus) cutoff if top_p < 1.0 on top_k subset using pure tensor ops
         if top_p < 1.0:
-            tri = Tensor.ones(top_k, top_k, device=t.device).tril()
-            cum_probs = output @ tri
-            prev_cum = cum_probs - output
-            mask = (prev_cum < top_p).cast(output.dtype)
-            output = output * mask
-            output = output / (output.sum() + 1e-10)
+            tri = Tensor.ones(top_k, top_k, device=probs.device).tril()
+            cum_probs = probs @ tri
+            prev_cum = cum_probs - probs
+            mask = (prev_cum < top_p).cast(probs.dtype)
+            probs = probs * mask
+            probs = probs / (probs.sum() + 1e-10)
 
-        output_idx = output.multinomial()
-        output_token = output_indices[output_idx]
+        output_idx = probs.multinomial()
+        output_token = top_k_indices[output_idx]
     else:
-        output_token = t.multinomial().cast(dtypes.int32)
+        probs = scaled_logits.softmax()
+        output_token = probs.multinomial().cast(dtypes.int32)
 
     return output_token
 
